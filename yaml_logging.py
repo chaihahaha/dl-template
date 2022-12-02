@@ -19,7 +19,7 @@ logger['config']=config                                  # 保存配置参数
 logger['datetime']=str(datetime.datetime.now())          # 保存训练开始时间
 logger['loss'] = []                                      # 保存loss日志
 logger['info'] = []                                      # 保存其他日志信息
-logger['env_vars'] = [os.environ['VAR_NAME']]            # 保存相关环境变量
+logger['env_vars'] = os.environ                          # 保存相关环境变量
 batch_cnt = 0
 log_freq = 100
 try:
