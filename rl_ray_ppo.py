@@ -90,6 +90,8 @@ class Context:
         self.obs_ctx.pop(0)
     def get(self):
         return torch.tensor(np.stack(self.obs_ctx, 0), dtype=self.dtype).unsqueeze(0)
+    def reset(self):
+        self.obs_ctx = [np.zeros(self.d_obs) for i in range(self.ctx_size)]
 
 def compute_advantages(rs, dones, values):
     gamma = 0.95
@@ -144,28 +146,30 @@ class Worker:
         self.context = Context(self.ctx_size, self.d_obs, self.dtype)
         self.T = 0
         self.rewards = []
-        self.return_finished = 0.0
+        self.avg_reward_finished = 0.0
     def get_weights(self):
         # 异步收集每个worker的权重用于平均
         return self.actor.state_dict()
-    def get_return(self):
+    def get_avg_reward(self):
         # 异步收集当前任务成功率等信息
-        return self.return_finished
+        return self.avg_reward_finished
     def get_weights_infos(self):
         # 合并多个异步收集任务，防止时间不同步
-        return self.get_weights(), self.get_return()
+        return self.get_weights(), self.get_avg_reward()
     def set_weights(self, w):
         # 为每个worker分发平均后的权重
         self.actor.load_state_dict(w)
     def reset_initialize(self):
         # 初始化仿真环境，上下文和log信息
+        self.context.reset()
         obs, _ = self.env.reset()
         self.context.add(obs)
         self.T = 0
         self.rewards = []
     def finalize(self):
         # episode结束，后处理log数据
-        self.return_finished = np.sum(self.rewards)
+        self.avg_reward_finished = np.mean(self.rewards)
+        self.memory.clear()
     def train_policy(self):
         # episode结束，训练策略网络
         n_batches = int(self.T / self.batch_size) + 1
@@ -241,7 +245,7 @@ def run_parallel():
     for i_episodes in range(n_episodes):
         # 收集worker的权重，只要有一个未收集完就会阻塞在这里
         weights_infos = ray.get([worker.get_weights_infos.remote() for worker in workers])
-        workers_weights, workers_return = zip(*weights_infos)
+        workers_weights, workers_reward = zip(*weights_infos)
         # 计算平均权重
         avg_weight = {k:sum([workers_weights[wid][k] for wid in range(n_workers)])/n_workers for k in avg_weight.keys()}
 
@@ -250,8 +254,8 @@ def run_parallel():
             worker.set_weights.remote(avg_weight)
 
         # 处理所有worker的log信息
-        avg_return = sum(workers_return)/n_workers
-        print(avg_return)
+        avg_reward = sum(workers_reward)/n_workers
+        print(avg_reward)
         time.sleep(0.2)
 if __name__ == '__main__':
     run_parallel()
