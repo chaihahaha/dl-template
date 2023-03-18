@@ -57,18 +57,27 @@ class ReplayMemory:
         self.done = []
         self.value = []
     def sample(self, ctx_size, batch_size):
+        M = len(self.r)
+        i = np.random.choice(range(ctx_size - 1, M), batch_size)
+
+        returns, advantages = compute_advantages(self.r, self.done, self.value)
+        returns = np.array(returns)[i]
+        advantages = np.array(advantages)[i]
+
         obs_np = np.array(self.obs)
         act_np = np.array(self.act)
         act_logprob_np = np.array(self.act_logprob)
-        r_np = np.array(self.r)
-        done_np = np.array(self.done)
-        M = len(self.r)
-        i = np.random.choice(range(ctx_size - 1, M), batch_size)
         obs_ctx = []
         for ctx_idx in range(ctx_size - 1, -1, -1):
             obs_ctx.append(obs_np[i - ctx_idx])
         obs_ctx = np.stack(obs_ctx, axis=1)
-        return torch.tensor(obs_ctx), torch.tensor(act_np[i]), torch.tensor(act_logprob_np[i]), torch.tensor(r_np[i]), torch.tensor(done_np[i])
+
+        obs_ctx = torch.tensor(obs_ctx)
+        act = torch.tensor(act_np[i])
+        act_logprob = torch.tensor(act_logprob_np[i])
+        returns = torch.tensor(returns)
+        advantages = torch.tensor(advantages)
+        return obs_ctx, act, act_logprob, returns, advantages
 
 class Context:
     def __init__(self, ctx_size, d_obs, dtype):
@@ -159,13 +168,11 @@ class Worker:
         self.return_finished = np.sum(self.rewards)
     def train_policy(self):
         # episode结束，训练策略网络
-        obs_ctxs, acts, act_logprobs, rs, dones = self.memory.sample(self.ctx_size, self.batch_size)   # 从重放记忆中采样经验
         n_batches = int(self.T / self.batch_size) + 1
-        values = self.memory.value
 
         # 计算Generalized Advantage Estimation
-        returns, advantages = compute_advantages(rs, dones, values)
         self.opt.zero_grad()
+        obs_ctxs, acts, act_logprobs, returns, advantages = self.memory.sample(self.ctx_size, self.batch_size)   # 从重放记忆中采样经验
         for _ in range(n_batches):
             _, _, pred_act_dist, pred_value = self.actor(obs_ctxs)
             loss = ppo_loss(pred_act_dist, pred_value, acts, act_logprobs, returns, advantages)
@@ -176,7 +183,7 @@ class Worker:
         done = False
         trunc = False
         self.reset_initialize()
-        while not (done or trunc):
+        while not done:
             obs_ctx = self.context.get() # 获取状态上下文
 
             # 根据状态上下文决策，得到动作，概率，和价值
@@ -186,7 +193,8 @@ class Worker:
             value = float(value.detach().numpy()[0])
 
             # 仿真一步
-            obs_, r, done, trunc, _ = self.env.step(act)
+            obs_, r, terminated, truncated, _ = self.env.step(act)
+            done = terminated or truncated
 
             # 将历史经验加入重放记忆中
             self.memory.add(self.context.obs_ctx[-1], act, act_logprob, r, done, value)
