@@ -7,7 +7,7 @@ import time
 
 ray.init(num_gpus=1)
 
-class ActorModel(nn.Module):
+class AgentModel(nn.Module):
     def __init__(self, ctx_size, d_obs, d_act, low, high):
         super().__init__()
         self.flatten = nn.Flatten()
@@ -56,11 +56,11 @@ class ReplayMemory:
         self.r = []
         self.done = []
         self.value = []
-    def sample(self, ctx_size, batch_size):
+    def sample(self, ctx_size, batch_size, last_value):
         M = len(self.r)
         i = np.random.choice(range(ctx_size - 1, M), batch_size)
 
-        returns, advantages = compute_advantages(self.r, self.done, self.value)
+        returns, advantages = compute_advantages(self.r, self.done, self.value + [last_value])
         returns = np.array(returns)[i]
         advantages = np.array(advantages)[i]
 
@@ -98,7 +98,6 @@ def compute_advantages(rs, dones, values):
     lambd = 0.95
     advantages = []
     returns = []
-    values = values + [values[-1]]
     adv = 0
     for tt in range(len(rs)-1, -1, -1):
         m = 1 - int(dones[tt])
@@ -140,76 +139,76 @@ class Worker:
         self.low = self.env.action_space.low
         self.high = self.env.action_space.high
         # 用于决策的神经网络
-        self.actor = ActorModel(self.ctx_size, self.d_obs, self.d_act, self.low, self.high)
-        self.opt = torch.optim.Adam(self.actor.parameters(), params['lr'])
+        self.agent = AgentModel(self.ctx_size, self.d_obs, self.d_act, self.low, self.high)
+        self.opt = torch.optim.Adam(self.agent.parameters(), params['lr'])
         self.memory = ReplayMemory()
         self.context = Context(self.ctx_size, self.d_obs, self.dtype)
         self.T = 0
-        self.rewards = []
-        self.avg_reward_finished = 0.0
+        self.rewards = [0.0]
+        self.done = False
     def get_weights(self):
         # 异步收集每个worker的权重用于平均
-        return self.actor.state_dict()
+        return self.agent.state_dict()
     def get_avg_reward(self):
         # 异步收集当前任务成功率等信息
-        return self.avg_reward_finished
-    def get_weights_infos(self):
+        avg_reward_finished = np.mean(self.rewards[-4:])
+        return avg_reward_finished
+    def train_get_weights_infos(self):
         # 合并多个异步收集任务，防止时间不同步
+        if self.T > self.ctx_size:
+            # 若episode时间够长，则训练
+            self.train_policy()
+            self.memory.clear()
         return self.get_weights(), self.get_avg_reward()
     def set_weights(self, w):
         # 为每个worker分发平均后的权重
-        self.actor.load_state_dict(w)
+        self.agent.load_state_dict(w)
     def reset_initialize(self):
         # 初始化仿真环境，上下文和log信息
         self.context.reset()
         obs, _ = self.env.reset()
         self.context.add(obs)
         self.T = 0
-        self.rewards = []
-    def finalize(self):
-        # episode结束，后处理log数据
-        self.avg_reward_finished = np.mean(self.rewards)
-        self.memory.clear()
     def train_policy(self):
         # episode结束，训练策略网络
         n_batches = int(self.T / self.batch_size) + 1
 
+        obs_ctx = self.context.get() # 获取状态上下文
+        _, _, _, last_value = self.agent(obs_ctx) # 获取不完全轨迹最后一个value用于bootstrap
+        last_value = float(last_value.detach().numpy()[0])
+
         # 计算Generalized Advantage Estimation
         self.opt.zero_grad()
-        obs_ctxs, acts, act_logprobs, returns, advantages = self.memory.sample(self.ctx_size, self.batch_size)   # 从重放记忆中采样经验
+        obs_ctxs, acts, act_logprobs, returns, advantages = self.memory.sample(self.ctx_size, self.batch_size, last_value)   # 从重放记忆中采样经验
         for _ in range(n_batches):
-            _, _, pred_act_dist, pred_value = self.actor(obs_ctxs)
+            _, _, pred_act_dist, pred_value = self.agent(obs_ctxs)
             loss = ppo_loss(pred_act_dist, pred_value, acts, act_logprobs, returns, advantages)
             (loss/n_batches).backward()
         self.opt.step()
-    def rollout(self):
+    def rollout(self, T_rollout):
         # 仿真循环，一直展开仿真到done为True
-        done = False
-        trunc = False
-        self.reset_initialize()
-        while not done:
+        for _ in range(T_rollout):
+            if self.done:
+                self.done = False
+                self.reset_initialize()
             obs_ctx = self.context.get() # 获取状态上下文
 
             # 根据状态上下文决策，得到动作，概率，和价值
-            act, act_logprob, _, value = self.actor(obs_ctx)
+            act, act_logprob, _, value = self.agent(obs_ctx)
             act = act.detach().numpy()[0]
             act_logprob = float(act_logprob.detach().numpy()[0])
             value = float(value.detach().numpy()[0])
 
             # 仿真一步
             obs_, r, terminated, truncated, _ = self.env.step(act)
-            done = terminated or truncated
+            self.done = terminated or truncated
 
             # 将历史经验加入重放记忆中
-            self.memory.add(self.context.obs_ctx[-1], act, act_logprob, r, done, value)
+            self.memory.add(self.context.obs_ctx[-1], act, act_logprob, r, self.done, value)
             # 将需要累积的状态向量加入上下文
             self.context.add(obs_)
             self.rewards.append(r)
             self.T += 1
-        if self.T > self.ctx_size:
-            # 若episode时间够长，则训练
-            self.train_policy()
-            self.finalize()
         return
 
 @ray.remote
@@ -220,10 +219,7 @@ class WorkerCaller:
     def start(self):
         # 对这个worker持续不断地触发rollout函数
         while True:
-            ray.get(self.worker.rollout.remote())
-
-            # 设置一个idle时间用于主进程收集权重和平均权重
-            time.sleep(0.1)
+            ray.get(self.worker.rollout.remote(128))
 
 def run_parallel():
     params = {'batch_size':64, 'ctx_size':8, 'lr':5e-4, 'n_episodes':99999999, 'n_workers':2, 'dtype':torch.float32 }
@@ -233,6 +229,7 @@ def run_parallel():
     # 初始化worker
     workers = [Worker.remote(params) for i in range(n_workers)]
     avg_weight = ray.get(workers[0].get_weights.remote())
+    ray.get([worker.reset_initialize.remote() for worker in workers])
 
     # 初始化持续调用worker的caller
     worker_callers = [WorkerCaller.remote(worker) for worker in workers]
@@ -240,11 +237,12 @@ def run_parallel():
     # 启动worker的caller，开始持续异步触发worker的rollout函数
     for caller in worker_callers:
         caller.start.remote()
+    time.sleep(1)
 
     # 主循环
     for i_episodes in range(n_episodes):
         # 收集worker的权重，只要有一个未收集完就会阻塞在这里
-        weights_infos = ray.get([worker.get_weights_infos.remote() for worker in workers])
+        weights_infos = ray.get([worker.train_get_weights_infos.remote() for worker in workers])
         workers_weights, workers_reward = zip(*weights_infos)
         # 计算平均权重
         avg_weight = {k:sum([workers_weights[wid][k] for wid in range(n_workers)])/n_workers for k in avg_weight.keys()}
@@ -256,6 +254,6 @@ def run_parallel():
         # 处理所有worker的log信息
         avg_reward = sum(workers_reward)/n_workers
         print(avg_reward)
-        time.sleep(0.2)
+        time.sleep(0.5)
 if __name__ == '__main__':
     run_parallel()
