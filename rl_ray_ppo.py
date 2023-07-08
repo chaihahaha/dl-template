@@ -213,16 +213,28 @@ class Worker:
 
 @ray.remote
 class WorkerCaller:
-    def __init__(self, worker):
+    def __init__(self, workers, rollout_steps):
         # 设置一个对应的worker
-        self.worker = worker
+        self.workers = workers
+        self.n_workers = len(workers)
+        self.rollout_steps = rollout_steps
     def start(self):
-        # 对这个worker持续不断地触发rollout函数
+        # 对workers持续不断地触发rollout函数
+        finish_indicators = [worker.rollout.remote(self.rollout_steps) for worker in self.workers]
         while True:
-            ray.get(self.worker.rollout.remote(128))
+            for i in range(self.n_workers):
+                if is_ready(finish_indicators[i]):
+                    finish_indicators[i] = self.workers[i].rollout.remote(self.rollout_steps)
+
+def is_ready(obj):
+    ready_oids, _ = ray.wait([obj])
+    if ready_oids:
+        return True
+    else:
+        return False
 
 def run_parallel():
-    params = {'batch_size':64, 'ctx_size':8, 'lr':5e-4, 'n_episodes':99999999, 'n_workers':2, 'dtype':torch.float32 }
+    params = {'batch_size':64, 'ctx_size':8, 'lr':5e-4, 'n_episodes':99999999, 'n_workers':2, 'rollout_steps':128, 'dtype':torch.float32 }
     n_episodes = params['n_episodes']
     n_workers = params['n_workers']
 
@@ -232,11 +244,10 @@ def run_parallel():
     ray.get([worker.reset_initialize.remote() for worker in workers])
 
     # 初始化持续调用worker的caller
-    worker_callers = [WorkerCaller.remote(worker) for worker in workers]
+    worker_caller = WorkerCaller.remote(workers, params['rollout_steps'])
 
     # 启动worker的caller，开始持续异步触发worker的rollout函数
-    for caller in worker_callers:
-        caller.start.remote()
+    worker_caller.start.remote()
     time.sleep(1)
 
     # 主循环
