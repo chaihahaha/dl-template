@@ -5,7 +5,7 @@ import gym
 import numpy as np
 import time
 
-ray.init(num_gpus=1)
+ray.init(num_gpus=1, local_mode=False)
 
 class AgentModel(nn.Module):
     def __init__(self, ctx_size, d_obs, d_act, low, high):
@@ -40,7 +40,8 @@ class AgentModel(nn.Module):
         return act, act_logprob, a_dist, value
 
 class ReplayMemory:
-    def __init__(self):
+    def __init__(self, dtype):
+        self.dtype = dtype
         self.clear()
     def add(self, obs, act, act_logprob, r, done, value):
         self.obs.append(obs)
@@ -72,26 +73,64 @@ class ReplayMemory:
             obs_ctx.append(obs_np[i - ctx_idx])
         obs_ctx = np.stack(obs_ctx, axis=1)
 
-        obs_ctx = torch.tensor(obs_ctx)
-        act = torch.tensor(act_np[i])
-        act_logprob = torch.tensor(act_logprob_np[i])
-        returns = torch.tensor(returns)
-        advantages = torch.tensor(advantages)
+        obs_ctx = torch.tensor(obs_ctx, dtype=self.dtype)
+        act = torch.tensor(act_np[i], dtype=self.dtype)
+        act_logprob = torch.tensor(act_logprob_np[i], dtype=self.dtype)
+        returns = torch.tensor(returns, dtype=self.dtype)
+        advantages = torch.tensor(advantages, dtype=self.dtype)
         return obs_ctx, act, act_logprob, returns, advantages
 
 class Context:
     def __init__(self, ctx_size, d_obs, dtype):
         self.ctx_size = ctx_size
         self.d_obs = d_obs
-        self.obs_ctx = [np.zeros(d_obs) for i in range(ctx_size)]
+        self.obs_ctx = [np.zeros(d_obs, dtype=np.float32) for i in range(ctx_size)]
         self.dtype = dtype
+        self.normalizer = Normalizer((d_obs,), np.float32)
     def add(self, obs):
-        self.obs_ctx.append(obs)
+        normalized_obs = self.normalizer.normalize_obs(obs)
+        self.obs_ctx.append(normalized_obs)
         self.obs_ctx.pop(0)
     def get(self):
         return torch.tensor(np.stack(self.obs_ctx, 0), dtype=self.dtype).unsqueeze(0)
     def reset(self):
         self.obs_ctx = [np.zeros(self.d_obs) for i in range(self.ctx_size)]
+    def set_normalizer(self, normalizer):
+        self.normalizer = normalizer
+
+class Normalizer:
+    def __init__(self, obs_shape, dtype):
+        self.dtype = dtype
+        self.obs_shape = obs_shape
+        self.sum_obs = np.zeros(obs_shape, dtype=dtype)
+        self.sumsq_obs = np.zeros(obs_shape, dtype=dtype) + 1e-3
+        self.cnt_obs = 1e-3
+
+        self.sum_obs_collect = np.zeros(obs_shape, dtype=dtype)
+        self.sumsq_obs_collect = np.zeros(obs_shape, dtype=dtype) + 1e-3
+        self.cnt_obs_collect = 1e-3
+    def aggregate_collection(self, normalizers):
+        for normalizer in normalizers:
+            self.sum_obs += normalizer.sum_obs_collect
+            self.sumsq_obs += normalizer.sumsq_obs_collect
+            self.cnt_obs += normalizer.cnt_obs_collect
+    def mean_std_obs(self):
+        mean_obs = self.sum_obs/self.cnt_obs
+        std_obs = np.sqrt(self.sumsq_obs/self.cnt_obs - mean_obs**2)
+        return mean_obs, std_obs
+    def normalize_obs(self, obs):
+        self.collect_obs(obs)
+        mean_obs, std_obs = self.mean_std_obs()
+        normalized_obs = (obs - mean_obs) / (1e-3 + std_obs)
+        return normalized_obs
+    def collect_obs(self, obs):
+        self.sum_obs_collect = self.sum_obs_collect + obs
+        self.sumsq_obs_collect = self.sumsq_obs_collect + obs**2
+        self.cnt_obs_collect = self.cnt_obs_collect + 1
+        #self.sum_obs_collect += obs # WHY isn't it working?
+        #self.sumsq_obs_collect += obs**2
+        #self.cnt_obs_collect += 1
+        return 
 
 def compute_advantages(rs, dones, values):
     gamma = 0.95
@@ -141,11 +180,13 @@ class Worker:
         # 用于决策的神经网络
         self.agent = AgentModel(self.ctx_size, self.d_obs, self.d_act, self.low, self.high)
         self.opt = torch.optim.Adam(self.agent.parameters(), params['lr'])
-        self.memory = ReplayMemory()
+        self.memory = ReplayMemory(self.dtype)
         self.context = Context(self.ctx_size, self.d_obs, self.dtype)
         self.T = 0
         self.rewards = [0.0]
         self.done = False
+    def get_info_dims(self):
+        return self.d_obs, self.d_act
     def get_weights(self):
         # 异步收集每个worker的权重用于平均
         return self.agent.state_dict()
@@ -159,10 +200,12 @@ class Worker:
             # 若episode时间够长，则训练
             self.train_policy()
             self.memory.clear()
-        return self.get_weights(), self.get_avg_reward()
+        return self.get_weights(), self.get_avg_reward(), self.context.normalizer
     def set_weights(self, w):
         # 为每个worker分发平均后的权重
         self.agent.load_state_dict(w)
+    def set_normalizer(self, normalizer):
+        self.context.set_normalizer(normalizer)
     def reset_initialize(self):
         # 初始化仿真环境，上下文和log信息
         self.context.reset()
@@ -241,7 +284,11 @@ def run_parallel():
     # 初始化worker
     workers = [Worker.remote(params) for i in range(n_workers)]
     avg_weight = ray.get(workers[0].get_weights.remote())
+    d_obs, d_act = ray.get(workers[0].get_info_dims.remote())
     ray.get([worker.reset_initialize.remote() for worker in workers])
+
+    # 初始化标准化器
+    normalizer = Normalizer((d_obs,), np.float32)
 
     # 初始化持续调用worker的caller
     worker_caller = WorkerCaller.remote(workers, params['rollout_steps'])
@@ -254,13 +301,18 @@ def run_parallel():
     for i_episodes in range(n_episodes):
         # 收集worker的权重，只要有一个未收集完就会阻塞在这里
         weights_infos = ray.get([worker.train_get_weights_infos.remote() for worker in workers])
-        workers_weights, workers_reward = zip(*weights_infos)
+        workers_weights, workers_reward, workers_normalizer = zip(*weights_infos)
         # 计算平均权重
         avg_weight = {k:sum([workers_weights[wid][k] for wid in range(n_workers)])/n_workers for k in avg_weight.keys()}
+        # 收集标准化器信息
+        normalizer.aggregate_collection(workers_normalizer)
 
         # 非阻塞异步地分发权重给每个worker
+        finish_setting_indicator = []
         for worker in workers:
-            worker.set_weights.remote(avg_weight)
+            finish_setting_indicator.append(worker.set_weights.remote(avg_weight))
+            finish_setting_indicator.append(worker.set_normalizer.remote(normalizer))
+        ray.get(finish_setting_indicator)
 
         # 处理所有worker的log信息
         avg_reward = sum(workers_reward)/n_workers
