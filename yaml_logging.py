@@ -6,6 +6,17 @@ import os
 import tqdm
 import datetime
 import uuid
+import code
+
+def handle_exception(*args, **kwargs):
+    vs = globals().copy()
+    vs.update(locals())
+    shell = code.InteractiveConsole(vs)
+    sys.__excepthook__(*args, **kwargs)
+    shell.interact()
+    return
+
+sys.excepthook = handle_exception
 
 os.environ['VAR_NAME']=sys.argv[1]                       # 设置与实验相关的环境变量（如CUDA_VISIBLE_DEVICES）
 experiment_id = str(uuid.uuid1())[:8]                    # 生成本次实验的UUID
