@@ -63,7 +63,7 @@ def plot_test_dec(x, y, filename):
     plt.savefig(filename)
     return 0
 
-def retrive_plot(filename):
+def retrieve_plot(filename):
     img = Image.open(filename)
     img.load()
     packed_info = dill.loads(img.info['exif'][6:])
@@ -78,4 +78,4 @@ if __name__ == '__main__':
     y = np.random.rand(10)
     #plot_random(x, y, 'test.png')
     plot_test_dec(x, y, 'test.png')
-    retrive_plot('test.png')
+    retrieve_plot('test.png')
