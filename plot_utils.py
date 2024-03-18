@@ -21,11 +21,12 @@ def packplot(plotf):
 
         ret = plotf(**kwargs)
 
+        plot_function_name = plotf.__name__
         try:
             plot_function_code = inspect.getsource(plotf)
         except OSError:
+            print(f"Cannot find the code of function {plot_function_name}")
             return ret
-        plot_function_name = plotf.__name__
         img = Image.open(filename)
         packed_info = (kwargs, plot_function_code, plot_function_name)
         packed_bytes = dill.dumps(packed_info)
@@ -68,6 +69,8 @@ def retrieve_plot(filename):
     img.load()
     packed_info = dill.loads(img.info['exif'][6:])
     plot_args, plot_function_code, plot_function_name = packed_info
+    assert plot_function_code.startswith("@packplot")
+    plot_function_code = plot_function_code.split("\n", 1)[1]
     filename = plot_args['filename']
     plot_args['filename'] = f'tmp-{str(hash(filename))}' + filename
     exec(plot_function_code)
