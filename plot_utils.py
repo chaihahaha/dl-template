@@ -57,13 +57,6 @@ def packplot(plotf):
 #        return
 #    return
 
-@packplot
-def plot_test_dec(x, y, filename):
-    plt.plot(x, y)
-    plt.show()
-    plt.savefig(filename)
-    return 0
-
 def retrieve_plot(filename):
     img = Image.open(filename)
     img.load()
@@ -77,6 +70,13 @@ def retrieve_plot(filename):
     exec(plot_function_name + '(**plot_args)')
 
 if __name__ == '__main__':
+    @packplot
+    def plot_test_dec(x, y, filename):
+        plt.plot(x, y)
+        plt.show()
+        plt.savefig(filename)
+        return 0
+
     x = np.random.rand(10)
     y = np.random.rand(10)
     #plot_random(x, y, 'test.png')
