@@ -222,8 +222,8 @@ class Worker:
 
         # 计算Generalized Advantage Estimation
         self.opt.zero_grad()
-        obs_ctxs, acts, act_logprobs, returns, advantages = self.memory.sample(self.ctx_size, self.batch_size, last_value)   # 从重放记忆中采样经验
         for _ in range(n_batches):
+            obs_ctxs, acts, act_logprobs, returns, advantages = self.memory.sample(self.ctx_size, self.batch_size, last_value)   # 从重放记忆中采样经验
             _, _, pred_act_dist, pred_value = self.agent(obs_ctxs)
             loss = ppo_loss(pred_act_dist, pred_value, acts, act_logprobs, returns, advantages)
             (loss/n_batches).backward()
