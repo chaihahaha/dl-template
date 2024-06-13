@@ -31,13 +31,14 @@ def packplot(plotf):
             return ret
         plot_function_code = clean_code(plot_function_code)
 
-        newname = uuid.uuid4().hex + filename
-        os.rename(filename, newname)
-        img = Image.open(newname)
+        img = Image.open(filename)
+        img_packed = img.copy()
+        img.close()
+        os.remove(filename)
+
         packed_info = (kwargs, plot_function_code, plot_function_name)
         packed_bytes = dill.dumps(packed_info)
-        img.save(filename, exif=packed_bytes)
-        img.close()
+        img_packed.save(filename, exif=packed_bytes)
         return ret
 
     return decorated_plotf
@@ -78,6 +79,8 @@ def clean_code(code_str):
                 cs.add(c)
             else:
                 should_break = True
+            if should_break:
+                break
         if should_break:
             break
         if len(cs)==1:
