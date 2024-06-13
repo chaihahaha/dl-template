@@ -69,6 +69,20 @@ def retrieve_plot(filename):
     exec(plot_function_code)
     exec(plot_function_name + '(**plot_args)')
 
+def retrieve_data(filename):
+    img = Image.open(filename)
+    img.load()
+    packed_info = dill.loads(img.info['exif'][6:])
+    plot_args, plot_function_code, plot_function_name = packed_info
+    return plot_args
+
+def retrieve_code(filename):
+    img = Image.open(filename)
+    img.load()
+    packed_info = dill.loads(img.info['exif'][6:])
+    plot_args, plot_function_code, plot_function_name = packed_info
+    return plot_function_code
+
 if __name__ == '__main__':
     @packplot
     def plot_test_dec(x, y, filename):
