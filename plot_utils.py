@@ -11,6 +11,7 @@ def packplot(plotf):
         import dill
         import inspect
         from PIL import Image
+        import os
         n_pos_args = len(args)
         all_arg_names = list(inspect.signature(plotf).parameters.keys())
         pos_arg_names = all_arg_names[:n_pos_args]
@@ -27,7 +28,10 @@ def packplot(plotf):
         except OSError:
             print(f"Cannot find the code of function {plot_function_name}")
             return ret
+        plot_function_code = clean_code(plot_function_code)
+
         img = Image.open(filename)
+        os.remove(filename)
         packed_info = (kwargs, plot_function_code, plot_function_name)
         packed_bytes = dill.dumps(packed_info)
         img.save(filename, exif=packed_bytes)
@@ -62,19 +66,22 @@ def clean_code(code_str):
     lines = code_str.splitlines()
     common_indent = ''
     min_len = min(len(l) for l in lines)
+    should_break = False
     for i in range(min_len):
         cs = set()
         for j in range(len(lines)):
             c = lines[j][i]
-            if c in ['\r','\n']:
+            if c in ['\t',' ']:
                 cs.add(c)
             else:
-                cs.add(j)
+                should_break = True
+        if should_break:
+            break
         if len(cs)==1:
             common_indent += list(cs)[0]
     
     # Strip leading and trailing whitespace from each line
-    cleaned_lines = [line.lstrip(common_indent) for line in lines]
+    cleaned_lines = [line[len(common_indent):] for line in lines]
     
     # Join the cleaned lines back into a single string with newlines
     cleaned_code_str = '\n'.join(cleaned_lines)
