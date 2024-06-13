@@ -57,12 +57,36 @@ def packplot(plotf):
 #        return
 #    return
 
+def clean_code(code_str):
+    # Split the code into lines
+    lines = code_str.splitlines()
+    common_indent = ''
+    min_len = min(len(l) for l in lines)
+    for i in range(min_len):
+        cs = set()
+        for j in range(len(lines)):
+            c = lines[j][i]
+            if c in ['\r','\n']:
+                cs.add(c)
+            else:
+                cs.add(j)
+        if len(cs)==1:
+            common_indent += list(cs)[0]
+    
+    # Strip leading and trailing whitespace from each line
+    cleaned_lines = [line.lstrip(common_indent) for line in lines]
+    
+    # Join the cleaned lines back into a single string with newlines
+    cleaned_code_str = '\n'.join(cleaned_lines)
+    
+    return cleaned_code_str
+
 def retrieve_plot(filename):
     img = Image.open(filename)
     img.load()
     packed_info = dill.loads(img.info['exif'][6:])
     plot_args, plot_function_code, plot_function_name = packed_info
-    assert plot_function_code.startswith("@packplot")
+    #assert plot_function_code.startswith("@packplot")
     plot_function_code = plot_function_code.split("\n", 1)[1]
     filename = plot_args['filename']
     plot_args['filename'] = f'tmp-{str(hash(filename))}' + filename
