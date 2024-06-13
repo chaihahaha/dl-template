@@ -12,6 +12,7 @@ def packplot(plotf):
         import inspect
         from PIL import Image
         import os
+        import uuid
         n_pos_args = len(args)
         all_arg_names = list(inspect.signature(plotf).parameters.keys())
         pos_arg_names = all_arg_names[:n_pos_args]
@@ -30,11 +31,13 @@ def packplot(plotf):
             return ret
         plot_function_code = clean_code(plot_function_code)
 
-        img = Image.open(filename)
-        os.remove(filename)
+        newname = uuid.uuid4().hex + filename
+        os.rename(filename, newname)
+        img = Image.open(newname)
         packed_info = (kwargs, plot_function_code, plot_function_name)
         packed_bytes = dill.dumps(packed_info)
         img.save(filename, exif=packed_bytes)
+        img.close()
         return ret
 
     return decorated_plotf
