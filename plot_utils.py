@@ -12,7 +12,6 @@ def packplot(plotf):
         import inspect
         from PIL import Image
         import os
-        import uuid
         n_pos_args = len(args)
         all_arg_names = list(inspect.signature(plotf).parameters.keys())
         pos_arg_names = all_arg_names[:n_pos_args]
