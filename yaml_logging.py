@@ -7,6 +7,7 @@ import tqdm
 import datetime
 import uuid
 import code
+import pdb
 
 def handle_exception(*args, **kwargs):
     vs = globals().copy()
@@ -49,3 +50,4 @@ except Exception:
     print(traceback.format_exc())
 finally:
     postprocess(model) # 训练结束后处理部分，比如保存模型权重等信息到磁盘
+    pdb.set_trace()
