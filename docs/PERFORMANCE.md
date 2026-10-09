@@ -93,7 +93,8 @@ model.pt  ->  model.bak-<UTC时间戳>-<id>.pt
 | `BackupPolicy(max_total_bytes=B)` / `DLT_NEVER_OVERWRITE_MAX_TOTAL_MB` | 单个文件的备份总量上限，超了删最旧的 |
 | `BackupPolicy(min_free_bytes=B)`（默认 512 MiB）/ `DLT_NEVER_OVERWRITE_MIN_FREE_MB` | **磁盘快满时自动删除最旧的备份**并打 warning，防止备份把盘写爆 |
 | `BackupPolicy(backup_dir=...)` | 备份集中到指定目录，便于统一清理/挂到另一块盘 |
-| `DLT_NEVER_OVERWRITE=0` | 彻底关闭 |
+| `install()` / `DLT_NEVER_OVERWRITE=1` | 显式开启**进程级**全局保护（默认不开启，避免影响第三方包） |
+| `@protect_paths` / `@protect` / `protect_scope` | 只在需要的函数/代码块/文件上保护，其余走原生 `open` |
 
 `min_free_bytes` 的剪枝实现见 `_enforce_free_space`：只删除符合备份命名规则的文件，
 按 mtime 从旧到新删，并逐条 warning，绝不会误删用户数据。

@@ -59,10 +59,11 @@ AGENTS.md 要求所有文件落在项目内。**结论**：`pyproject.toml` 里
 `install()`（因为 `policy or _POLICY`）。**结论**：`uninstall` 置 `_POLICY=None`，
 `install(policy=None)` 在未安装时给默认策略。
 
-## 10. 兼容 shim 的 import 副作用
+## 10. 兼容 shim 的 import 副作用（已改变）
 
-`dlt/never_overwrite.py` 在 import 时自动 `install()`（受 `DLT_NEVER_OVERWRITE` 控制）。
-测试里通过 conftest 设 `DLT_NEVER_OVERWRITE=0`，避免整套测试期间 `open` 被全局改写。
+早期 `dlt/never_overwrite.py` 在 import 时自动 `install()`，会全局改写 `open`。现已改为
+**默认不安装**：`import` 无副作用，用 `@protect` / `protect_scope` / `install()` 按需开启。
+测试里不再需要靠环境变量规避，直接 `uninstall()` 即可。
 
 ---
 

@@ -20,6 +20,21 @@
 是原子、几乎零成本、不消耗额外磁盘。旧实现用“剩余空间 > 16 GiB”作为开关，方向反了：
 磁盘越紧张越不能覆盖，因此新实现始终备份。
 
+## 为什么默认不 patch `open`、改成装饰器/作用域？
+
+全局 patch `builtins.open` 会波及**进程里的所有代码**：第三方库正常的 `write_text`、
+临时文件、缓存都会莫名其妙产生 `.bak-*`，甚至打断依赖文件语义的逻辑。因此：
+
+* 默认**不安装**任何 patch（`import dlt.never_overwrite` 无副作用）；
+* `@protect_paths("path")` 完全不改 `open`，只是在调用前把指定参数备份走，语义最清晰，
+  而且对 `torch.save` 这种绕过 `open` 的写法同样有效；
+* `@protect` / `protect_scope(only=[...])` 只在函数/代码块执行期间替换 `open`，退出即还原，
+  还可以用 `only` 把范围限制到具体文件/目录，避免影响被调用的第三方库；
+* 只有确实需要时才 `install()`（或 `DLT_NEVER_OVERWRITE=1`）做进程级 patch。
+
+代价是作用域内仍然是全局替换（Python 没有更细的拦截点），所以 `only` 过滤和“退出即还原”
+是这道设计的关键。
+
 `torch.save` 在现代 PyTorch 中走 C++ 写出路径，不经过 Python `open`，所以单独提供
 `protect_torch()` 包装。类似地，如果将来用到其它绕过 `open` 的写出 API，应在
 `_auto_protect_optional()` 中补充，而不是去 patch 更多底层函数。

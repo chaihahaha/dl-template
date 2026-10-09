@@ -7,7 +7,7 @@
 | 工具 | 一句话 | 依赖 |
 | --- | --- | --- |
 | `dlt.yaml_logging.YamlLogger` | 崩溃安全的 YAML 实验日志（可 `grep`、`Ctrl+C` 不丢数据） | PyYAML |
-| `dlt.never_overwrite` | 覆盖前先备份，保护 `open` 和 `torch.save` | 无 |
+| `dlt.never_overwrite` | 按需备份覆盖写：装饰器 / 作用域，默认不魔改全局 `open` | 无 |
 | `dlt.naming` | 可排序、不撞名的实验/文件命名 | 无 |
 | `dlt.plot_utils.packplot` | 把画图代码和数据嵌进图片，随时重画 | Pillow |
 | `dlt.integrations.lightning.DLTLogger` | 给 PyTorch Lightning `Trainer` 用上面这套日志 | lightning（可选） |
@@ -125,20 +125,28 @@ outputs/  runs/          # 运行产物
 ## 把四个工具接进你的训练循环
 
 ```python
-import never_overwrite                       # 第一行：覆盖前自动备份
 from dlt import ExperimentNamer, YamlLogger
+from dlt.never_overwrite import protect_paths
 from dlt.plot_utils import packplot
 
 config = {"lr": 1e-3, "batch_size": 64, "model": "MyNet"}
 run = ExperimentNamer("runs", name="mynet").new_run(config)
 
+@protect_paths("path")                       # 只在保存时备份，不改全局 open
+def save_checkpoint(state, path):
+    torch.save(state, path)
+
 with YamlLogger("mynet", run=run, config=config, save_every=100, async_save=True) as log:
     for epoch in range(epochs):
         loss = train_one_epoch(model, train_loader)
         log.log(epoch=epoch, loss=loss)      # 落盘交给后台线程，不阻塞训练
-    torch.save(model.state_dict(), run.ckpts / "final.pt")   # 已受防覆盖保护
+    save_checkpoint(model.state_dict(), path=run.ckpts / "final.pt")
     log.add_artifact(run.ckpts / "final.pt")
 ```
+
+> `import never_overwrite` **不再**修改全局 `open`。需要保护某个函数/代码块时用
+> `@protect`、`with protect_scope(...)`，或像上面 `@protect_paths("path")` 那样只备份
+> 指定参数；详见下面的“防覆盖：三种用法”。
 
 画一张会“自我描述”的图（图片里存了画图函数、参数，删除脚本后仍能重画）：
 
@@ -164,6 +172,40 @@ trainer = Trainer(
 trainer.fit(model, train_dataloaders=train_loader)
 ```
 
+## 防覆盖：三种用法
+
+默认**不修改** Python 的 `open`，只有在你要保护的地方才生效：
+
+```python
+from dlt.never_overwrite import backup, protect, protect_paths, protect_scope, BackupPolicy
+
+# 1) 只备份指定参数（推荐，完全不改 open；对 torch.save 等绕过 open 的写法也有效）
+@protect_paths("path")
+def save_checkpoint(state, path):
+    torch.save(state, path)
+
+# 2) 备份一个函数/代码块里的所有覆盖写（进入时装，退出时恢复原版 open）
+@protect
+def export(result, path):
+    ...
+
+with protect_scope(only=["runs/exp1"], policy=BackupPolicy(keep=5)):
+    ...                       # 只有 runs/exp1 下的覆盖写会备份
+
+# 3) 一次性备份
+backup("result.csv")          # 立刻把已存在的 result.csv 改名留档
+```
+
+只有在确实需要“整个进程都保护”时才显式全局安装：
+
+```python
+import dlt.never_overwrite as nw
+nw.install(policy=nw.BackupPolicy(keep=5))   # 进程级 patch
+nw.uninstall()                               # 还原
+```
+
+`import never_overwrite`（旧写法）本身不再产生任何副作用。
+
 ## 常用 API 速查
 
 | 需求 | 写法 |
@@ -173,7 +215,7 @@ trainer.fit(model, train_dataloaders=train_loader)
 | 强制落盘 | `log.save()` / `log.flush()` / `log.close()` |
 | 读日志 | `from dlt import load_log, latest_log` |
 | 备份策略 | `BackupPolicy(keep=5, max_total_bytes=..., min_free_bytes=...)` |
-| 关掉防覆盖 | 环境变量 `DLT_NEVER_OVERWRITE=0` |
+| 全局开启防覆盖 | `dlt.never_overwrite.install()`（或 `DLT_NEVER_OVERWRITE=1`） |
 | 自定义命名 | `from dlt import auto_name; auto_name("loss curve", ext=".png", directory="imgs")` |
 | 重画图片 | `from dlt import retrieve_plot; retrieve_plot("loss.png", allow_execute=True)` |
 | 只看数据/代码 | `retrieve_data("loss.png")` / `retrieve_code("loss.png")` |

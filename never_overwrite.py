@@ -1,14 +1,16 @@
-"""Backwards-compatible shim.
+"""Backwards-compatible shim for the old top-level ``never_overwrite`` module.
 
-The original template told you to put ``import never_overwrite`` on the first
-line of your training script.  That still works: importing this module enables
-the protection implemented in :mod:`dlt.never_overwrite`.
+.. important::
+   Importing this module **no longer patches** Python's ``open``.  The old
+   import-time monkey patch affected every package in the process, so it is now
+   opt-in.  Use one of these instead:
 
-New code can equivalently write::
+   * ``@protect_paths("path")`` -- back up specific file arguments (no patch);
+   * ``@protect`` / ``with protect_scope(...)`` -- scoped patch, restored on exit;
+   * ``install()`` -- explicit, process-wide patch.
 
-    import dlt.never_overwrite   # noqa: F401  (import for the side effect)
-
-Set ``DLT_NEVER_OVERWRITE=0`` to import without patching ``open``.
+Set ``DLT_NEVER_OVERWRITE=1`` before importing if you really want the global
+patch applied automatically.
 """
 
 from dlt.never_overwrite import (  # noqa: F401
@@ -16,6 +18,9 @@ from dlt.never_overwrite import (  # noqa: F401
     backup,
     install,
     is_installed,
+    protect,
+    protect_paths,
+    protect_scope,
     protect_torch,
     safe_open,
     uninstall,
@@ -26,6 +31,9 @@ __all__ = [
     "backup",
     "install",
     "is_installed",
+    "protect",
+    "protect_paths",
+    "protect_scope",
     "protect_torch",
     "safe_open",
     "uninstall",

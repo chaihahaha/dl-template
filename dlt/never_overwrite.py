@@ -1,49 +1,75 @@
-"""Never lose data to an accidental ``open(path, "w")``.
+"""Never lose data to an accidental ``open(path, "w")`` -- without patching the
+whole process.
 
-``import dlt.never_overwrite`` (or the top-level ``import never_overwrite``
-shim) installs a drop-in replacement for :func:`open`, :func:`io.open` and
-therefore :meth:`pathlib.Path.open` / :meth:`~pathlib.Path.write_text`.  When a
-file that already exists is opened in a truncating mode (``"w"`` / ``"w+"``),
-the old content is **renamed to a timestamped backup in the same directory**
-before the truncation happens.  The returned file object is the normal one, so
-the change is transparent to the rest of your code::
+The old version patched :func:`builtins.open` **at import time**, so every
+library in the process (and every unrelated ``write_text``) silently produced
+``.bak-*`` files.  Importing this module now has **no side effects**: normal
+Python I/O stays untouched.  Protection is opt-in, at the granularity you
+choose.
 
-    import never_overwrite
-    with open("result.csv", "w") as fh:     # result.csv -> result.bak-...-ab12.csv
-        fh.write("new data")
+Three ways to use it
+--------------------
+1. Back up specific files, no monkey-patching at all (recommended)::
 
-Design notes / fixed bugs compared with the original implementation
--------------------------------------------------------------------
-* The old version only created a backup when the root filesystem had more than
-  16 GiB free, and otherwise **silently overwrote the file**.  Renaming within
-  one directory costs no extra space, so we now always back up and rely on
-  :func:`os.replace` (atomic, same-filesystem).
-* ``open(file, mode, *args)`` extras (buffering, encoding, ...) are forwarded
-  correctly; the original signature dropped them and raised ``TypeError``.
-* File descriptors (``open(fd, "w")``) and non-path objects are passed through.
-* Symlinks are not moved (that would change what the link points at); the
-  backup step is skipped for them.
-* ``mode="x"`` already refuses to overwrite, and ``mode="a"`` never truncates,
-  so neither needs a backup.
-* Backups are named ``<stem>.bak-<utc-timestamp>-<id><ext>`` and can optionally
-  be capped with ``keep=N``.  Every action is logged to the
-  ``dlt.never_overwrite`` logger.
-* Repeatedly rewriting one large file (e.g. a checkpoint every epoch) used to
-  grow the backup set without bound.  ``keep``, ``max_total_bytes`` and a
-  ``min_free_bytes`` disk-space guard (default 512 MiB) now bound how much disk
-  backups can consume; the guard only removes files matching the backup naming
-  scheme, oldest first, and logs a warning.
+       from dlt.never_overwrite import protect_paths
 
-This module intentionally has **no third-party dependencies**.
+       @protect_paths("path")           # backs up the file before the call
+       def save_checkpoint(state, path):
+           torch.save(state, path)
+
+   or simply call ``backup("result.csv")`` before writing.
+
+2. Protect a whole function/block with a *scoped* replacement for ``open``.
+   It is installed on entry and the pristine ``open`` is restored on exit, so
+   nothing outside the scope is affected::
+
+       from dlt.never_overwrite import protect
+
+       @protect                              # any overwrite inside is backed up
+       def export(result, path):
+           ...
+
+       @protect(only=["runs/exp1"])          # only writes under this directory
+       def train(...):
+           ...
+
+3. Explicitly opt into the global patch (what the module used to do on import)::
+
+       import dlt.never_overwrite as nw
+       nw.install(policy=nw.BackupPolicy(keep=5))
+       ...
+       nw.uninstall()
+
+   ``DLT_NEVER_OVERWRITE=1`` also turns the global install on at import time.
+
+Design notes / fixed bugs
+-------------------------
+* ``os.replace`` within one directory is atomic and costs no extra space, so we
+  always back up (the original only backed up when the disk had > 16 GiB free,
+  and otherwise **silently overwrote** the file).
+* ``open(file, mode, *args)`` extras (buffering, encoding, ...) are forwarded;
+  file descriptors and non-path objects pass through untouched.
+* Symlinks are skipped (moving a link would change what it points at), and
+  ``mode="x"`` / ``mode="a"`` need no backup.
+* Backups are ``<stem>.bak-<utc-timestamp>-<id><ext>``.  ``keep``,
+  ``max_total_bytes`` and a ``min_free_bytes`` disk-space guard (default
+  512 MiB) bound how much disk they can consume.
+* ``protect`` only affects writes made while it runs; packages doing unrelated
+  I/O outside the scope (or to files not matching ``only``) use normal ``open``.
+
+No third-party dependencies.
 """
 
 from __future__ import annotations
 
 import builtins
+import contextlib
+import functools
+import inspect
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .naming import short_id, timestamp, unique_path
 
@@ -51,6 +77,9 @@ __all__ = [
     "BackupPolicy",
     "backup",
     "safe_open",
+    "protect",
+    "protect_scope",
+    "protect_paths",
     "protect_torch",
     "install",
     "uninstall",
@@ -69,6 +98,8 @@ except Exception:  # pragma: no cover
 _LOCK = threading.RLock()
 _INSTALLED = False
 _POLICY: "BackupPolicy | None" = None
+#: stack of active ``protect`` scopes: (policy, path matcher or None)
+_SCOPE_STACK: list[tuple["BackupPolicy", Callable[[str], bool] | None]] = []
 
 
 @dataclass
@@ -229,6 +260,57 @@ def _remove_backup(path: str, policy: BackupPolicy) -> bool:
         return False
 
 
+def _build_matcher(only: Iterable[Any] | None) -> Callable[[str], bool] | None:
+    """Turn ``only`` into a predicate over absolute paths.
+
+    Entries may be file paths (exact match), directories (prefix match) or
+    callables taking the absolute path.
+    """
+    if only is None:
+        return None
+    resolved: list[tuple[str, Any]] = []
+    for item in only:
+        if callable(item):
+            resolved.append(("call", item))
+        else:
+            absolute = os.path.abspath(os.fspath(item))
+            resolved.append(("dir", absolute) if os.path.isdir(absolute) else ("file", absolute))
+
+    def match(path: str) -> bool:
+        absolute = os.path.abspath(path)
+        for kind, value in resolved:
+            if kind == "call":
+                try:
+                    if value(absolute):
+                        return True
+                except Exception:
+                    continue
+            elif kind == "dir":
+                if absolute == value or absolute.startswith(value + os.sep):
+                    return True
+            elif absolute == value:
+                return True
+        return False
+
+    return match
+
+
+def _active_policy() -> BackupPolicy:
+    """Policy for an explicit :func:`backup` call.
+
+    Prefers the innermost ``protect`` scope, then a global ``install``, and
+    otherwise an ordinary enabled policy (calling ``backup`` directly means the
+    caller *wants* a backup).  :func:`safe_open` does not use this helper: it
+    checks the scope/install state itself and stays inert when neither is set.
+    """
+    with _LOCK:
+        if _SCOPE_STACK:
+            return _SCOPE_STACK[-1][0]
+        if _INSTALLED and _POLICY is not None:
+            return _POLICY
+        return BackupPolicy()
+
+
 def backup(
     path: str | os.PathLike[str],
     *,
@@ -239,7 +321,7 @@ def backup(
     Returns ``None`` when nothing was done (missing file, empty file, disabled
     policy, ...).  Safe to call repeatedly.
     """
-    policy = (policy or _POLICY or BackupPolicy()).normalized()
+    policy = (policy or _active_policy()).normalized()
     if not policy.enabled:
         return None
     path = os.fspath(path)
@@ -276,11 +358,13 @@ def backup(
 
 
 def safe_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
-    """Drop-in :func:`open` that backs up truncating writes."""
-    policy = (_POLICY or BackupPolicy()).normalized()
+    """Drop-in :func:`open` that backs up truncating writes.
+
+    Only active inside a :func:`protect_scope` / :func:`protect` or after an
+    explicit :func:`install`; other callers get the original ``open``.
+    """
     if (
-        policy.enabled
-        and isinstance(mode, str)
+        isinstance(mode, str)
         and "w" in mode
         and not isinstance(file, int)
         and file is not None
@@ -288,21 +372,140 @@ def safe_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
     ):
         path = os.fsdecode(os.fspath(file))
         with _LOCK:
-            backup(path, policy=policy)
+            if _SCOPE_STACK:
+                policy, matcher = _SCOPE_STACK[-1]
+            elif _INSTALLED:
+                policy, matcher = (_POLICY or BackupPolicy()), None
+            else:
+                policy, matcher = BackupPolicy(enabled=False), None
+        if policy.enabled and (matcher is None or matcher(path)):
+            with _LOCK:
+                backup(path, policy=policy)
     return _ORIGINAL_OPEN(file, mode, *args, **kwargs)
 
 
+@contextlib.contextmanager
+def protect_scope(
+    *,
+    policy: BackupPolicy | None = None,
+    only: Iterable[Any] | None = None,
+    also_io: bool = True,
+) -> Any:
+    """Context manager that replaces ``open`` only for its own duration.
+
+    Parameters
+    ----------
+    policy:
+        Backup policy used inside the scope.
+    only:
+        Restrict protection to these files/directories (or a predicate).  This
+        is the safest way to make sure third-party code doing unrelated I/O is
+        never touched.
+    also_io:
+        Also replace ``io.open`` (covers ``pathlib`` writes).
+    """
+    entry = ((policy or BackupPolicy()).normalized(), _build_matcher(only))
+    with _LOCK:
+        first = not _SCOPE_STACK
+        _SCOPE_STACK.append(entry)
+        if first and not _INSTALLED:
+            builtins.open = safe_open
+            if also_io and _io is not None:
+                _io.open = safe_open
+    try:
+        yield
+    finally:
+        with _LOCK:
+            _SCOPE_STACK.pop()
+            if not _SCOPE_STACK and not _INSTALLED:
+                if builtins.open is safe_open:
+                    builtins.open = _ORIGINAL_OPEN
+                if _io is not None and _io.open is safe_open and _ORIGINAL_IO_OPEN is not None:
+                    _io.open = _ORIGINAL_IO_OPEN
+
+
+def protect(
+    func: Callable[..., Any] | None = None,
+    *,
+    policy: BackupPolicy | None = None,
+    only: Iterable[Any] | None = None,
+    also_io: bool = True,
+) -> Callable[..., Any]:
+    """Decorator form of :func:`protect_scope`.
+
+    Works as ``@protect`` or ``@protect(policy=..., only=...)``.  The pristine
+    ``open`` is restored when the call returns, including on exceptions.
+    """
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with protect_scope(policy=policy, only=only, also_io=also_io):
+                return function(*args, **kwargs)
+
+        return wrapper
+
+    return decorate(func) if func is not None else decorate
+
+
+def protect_paths(*param_names: str, policy: BackupPolicy | None = None) -> Callable[..., Any]:
+    """Decorator: back up path-valued arguments before calling the function.
+
+    This does **not** patch anything -- it simply moves the named arguments
+    aside first, then lets the function write normally.  Ideal for checkpoint /
+    export helpers::
+
+        @protect_paths("path")
+        def save_checkpoint(state, path):
+            torch.save(state, path)
+
+    An argument may also be a list/tuple of paths.  ``None`` entries are
+    ignored.
+    """
+    if not param_names:
+        raise TypeError("protect_paths() needs at least one argument name")
+
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            for name in param_names:
+                if name not in bound.arguments:
+                    raise TypeError(
+                        f"{function.__name__}() has no argument {name!r}; "
+                        "check @protect_paths(...)"
+                    )
+                value = bound.arguments[name]
+                paths = (
+                    list(value)
+                    if isinstance(value, (list, tuple, set, frozenset))
+                    else [value]
+                )
+                for candidate in paths:
+                    if candidate is None or not isinstance(
+                        candidate, (str, bytes, os.PathLike)
+                    ):
+                        continue
+                    with _LOCK:
+                        backup(os.fsdecode(os.fspath(candidate)), policy=policy)
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 def protect_torch() -> Any:
-    """Back up the destination of ``torch.save(obj, path)``.
+    """Back up the destination of ``torch.save(obj, path)`` (opt-in global patch).
 
     Modern PyTorch writes checkpoints through a C++ file writer that never
-    touches Python's :func:`open`, so patching ``open`` alone does **not**
-    protect ``torch.save``.  Calling this (or :func:`install`, which calls it
-    automatically when torch is already imported) wraps ``torch.save`` so the
-    existing checkpoint is backed up first.
+    touches Python's :func:`open`, so :func:`protect` alone does not cover it.
+    Prefer :func:`protect_paths` on your own save function; use this only if you
+    want every ``torch.save`` in the process protected.
     """
-    import functools
-
     torch = __import__("torch")
     save = torch.save
     if getattr(save, "_dlt_protected", False):
@@ -336,7 +539,10 @@ def install(
     policy: BackupPolicy | None = None,
     also_io: bool = True,
 ) -> BackupPolicy:
-    """Install the patched ``open``.  Idempotent; returns the active policy."""
+    """Explicitly patch ``open`` for the rest of the process.
+
+    Importing the module no longer does this.  Returns the active policy.
+    """
     global _INSTALLED, _POLICY
     with _LOCK:
         if policy is not None:
@@ -353,46 +559,51 @@ def install(
 
 
 def uninstall() -> None:
-    """Restore the original ``open`` and reset the policy (mainly for tests)."""
+    """Undo :func:`install` (and any running scope) and restore ``open``."""
     global _INSTALLED, _POLICY
     with _LOCK:
-        if builtins.open is safe_open:
-            builtins.open = _ORIGINAL_OPEN
-        if _io is not None and _io.open is safe_open and _ORIGINAL_IO_OPEN is not None:
-            _io.open = _ORIGINAL_IO_OPEN
         _INSTALLED = False
         _POLICY = None
+        if not _SCOPE_STACK:
+            if builtins.open is safe_open:
+                builtins.open = _ORIGINAL_OPEN
+            if _io is not None and _io.open is safe_open and _ORIGINAL_IO_OPEN is not None:
+                _io.open = _ORIGINAL_IO_OPEN
 
 
 def is_installed() -> bool:
     return _INSTALLED
 
 
-def _env_enabled() -> bool:
-    value = os.environ.get("DLT_NEVER_OVERWRITE", os.environ.get("DLT_NO_OVERWRITE", "1"))
-    return value.strip().lower() not in ("0", "false", "off", "no", "")
+def _env_wants_install() -> bool:
+    value = os.environ.get("DLT_NEVER_OVERWRITE")
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-# Importing this module is the documented way to enable protection, so do it
-# automatically unless the user opted out with DLT_NEVER_OVERWRITE=0.
-if _env_enabled():
-    _keep = os.environ.get("DLT_NEVER_OVERWRITE_KEEP")
-    _min_free_mb = os.environ.get("DLT_NEVER_OVERWRITE_MIN_FREE_MB")
-    _max_total_mb = os.environ.get("DLT_NEVER_OVERWRITE_MAX_TOTAL_MB")
-    install(
-        policy=BackupPolicy(
-            keep=int(_keep) if _keep and _keep.isdigit() else None,
-            min_free_bytes=(
-                int(_min_free_mb) * 1024 * 1024
-                if _min_free_mb is not None and _min_free_mb.lstrip("-").isdigit()
-                else BackupPolicy.min_free_bytes
-            ),
-            max_total_bytes=(
-                int(_max_total_mb) * 1024 * 1024
-                if _max_total_mb is not None and _max_total_mb.isdigit()
-                else None
-            ),
-            verbose=os.environ.get("DLT_NEVER_OVERWRITE_VERBOSE", "0").lower()
-            in ("1", "true", "on", "yes"),
-        )
+def _policy_from_env() -> BackupPolicy:
+    keep = os.environ.get("DLT_NEVER_OVERWRITE_KEEP")
+    min_free_mb = os.environ.get("DLT_NEVER_OVERWRITE_MIN_FREE_MB")
+    max_total_mb = os.environ.get("DLT_NEVER_OVERWRITE_MAX_TOTAL_MB")
+    return BackupPolicy(
+        keep=int(keep) if keep and keep.isdigit() else None,
+        min_free_bytes=(
+            int(min_free_mb) * 1024 * 1024
+            if min_free_mb is not None and min_free_mb.lstrip("-").isdigit()
+            else BackupPolicy.min_free_bytes
+        ),
+        max_total_bytes=(
+            int(max_total_mb) * 1024 * 1024
+            if max_total_mb is not None and max_total_mb.isdigit()
+            else None
+        ),
+        verbose=os.environ.get("DLT_NEVER_OVERWRITE_VERBOSE", "0").lower()
+        in ("1", "true", "on", "yes"),
     )
+
+
+# Importing is a no-op by default.  Set DLT_NEVER_OVERWRITE=1 (or call install())
+# if you really want the whole process patched.
+if _env_wants_install():
+    install(policy=_policy_from_env())

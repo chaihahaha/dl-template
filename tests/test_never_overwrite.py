@@ -175,3 +175,116 @@ def test_logger_saves_do_not_create_backups(tmp_path: Path) -> None:
     log.close()
     assert backups_of(tmp_path, log.path.name) == []
     assert [p for p in tmp_path.iterdir() if p.suffix == ".bak" or ".bak-" in p.name] == []
+
+
+# --------------------------------------------------------------------------- #
+# opt-in usage: importing must not patch anything
+# --------------------------------------------------------------------------- #
+def test_import_does_not_patch_open() -> None:
+    assert nw.is_installed() is False
+    assert builtins.open is not nw.safe_open
+
+
+def test_protect_decorator_scopes_and_restores_open(tmp_path: Path) -> None:
+    original = builtins.open
+    target = tmp_path / "a.txt"
+    target.write_text("first")
+
+    @nw.protect
+    def rewrite(path: Path) -> bool:
+        with open(path, "w") as handle:
+            handle.write("second")
+        return builtins.open is nw.safe_open
+
+    assert rewrite(target) is True  # patched only inside the call
+    assert target.read_text() == "second"
+    assert len(backups_of(tmp_path, "a")) == 1
+    assert builtins.open is original  # restored afterwards
+
+
+def test_protect_scope_restores_on_exception(tmp_path: Path) -> None:
+    original = builtins.open
+    with pytest.raises(RuntimeError):
+        with nw.protect_scope():
+            assert builtins.open is nw.safe_open
+            raise RuntimeError("boom")
+    assert builtins.open is original
+
+
+def test_protect_nesting_restores_only_at_the_end(tmp_path: Path) -> None:
+    original = builtins.open
+
+    @nw.protect
+    def inner() -> bool:
+        return builtins.open is nw.safe_open
+
+    @nw.protect
+    def outer() -> bool:
+        inside_outer = builtins.open is nw.safe_open
+        result = inner()
+        return inside_outer and result and builtins.open is nw.safe_open
+
+    assert outer() is True
+    assert builtins.open is original
+
+
+def test_protect_only_ignores_unrelated_files(tmp_path: Path) -> None:
+    protected_dir = tmp_path / "runs"
+    other_dir = tmp_path / "other"
+    protected_dir.mkdir()
+    other_dir.mkdir()
+    protected_file = protected_dir / "x.txt"
+    other_file = other_dir / "y.txt"
+    protected_file.write_text("1")
+    other_file.write_text("1")
+
+    @nw.protect(only=[protected_dir])
+    def rewrite_both() -> None:
+        with open(protected_file, "w") as handle:
+            handle.write("2")
+        with open(other_file, "w") as handle:
+            handle.write("2")
+
+    rewrite_both()
+    assert len(backups_of(protected_dir, "x")) == 1
+    assert backups_of(other_dir, "y") == []  # untouched by the scope
+
+
+def test_protect_paths_needs_no_patch(tmp_path: Path) -> None:
+    target = tmp_path / "ckpt.bin"
+    target.write_bytes(b"old")
+
+    @nw.protect_paths("path")
+    def save(state: bytes, path: Path) -> None:
+        assert builtins.open is not nw.safe_open  # no monkey patch involved
+        with open(path, "wb") as handle:
+            handle.write(state)
+
+    save(b"new", path=target)
+    assert target.read_bytes() == b"new"
+    assert len(backups_of(tmp_path, "ckpt")) == 1
+
+
+def test_protect_paths_accepts_a_collection(tmp_path: Path) -> None:
+    targets = [tmp_path / "a.txt", tmp_path / "b.txt"]
+    for item in targets:
+        item.write_text("old")
+
+    @nw.protect_paths("paths")
+    def save_all(paths) -> None:
+        for item in paths:
+            item.write_text("new")
+
+    save_all(targets)
+    assert all(item.read_text() == "new" for item in targets)
+    assert len(backups_of(tmp_path, "a")) == 1
+    assert len(backups_of(tmp_path, "b")) == 1
+
+
+def test_protect_paths_reports_unknown_argument() -> None:
+    @nw.protect_paths("nope")
+    def save(x) -> None:
+        pass
+
+    with pytest.raises(TypeError):
+        save(1)

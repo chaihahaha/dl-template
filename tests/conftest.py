@@ -3,8 +3,8 @@
 * Keep pytest's temporary directories inside the project (``tmp/pytest``)
   instead of ``/tmp``, per the repository's AGENTS.md rules.
 * Render matplotlib headless, with its font cache inside ``./cache``.
-* Disable the auto-install of :mod:`dlt.never_overwrite` at import time so the
-  test-suite can install/uninstall it explicitly and stay isolated.
+* Keep :mod:`dlt.never_overwrite` inert; importing it no longer patches ``open``,
+  and each test installs/uninstalls explicitly for isolation.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-os.environ.setdefault("DLT_NEVER_OVERWRITE", "0")
+# Belt and braces: `import never_overwrite` must not patch open in the tests.
+os.environ["DLT_NEVER_OVERWRITE"] = "0"
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "cache" / "matplotlib"))
 os.environ.setdefault("OMP_NUM_THREADS", "1")

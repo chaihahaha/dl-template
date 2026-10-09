@@ -25,6 +25,14 @@
 - [x] plot 只依赖 Pillow（移除 dill）；新增 `EncodeLimits`、`include`/`exclude`
 - [x] README 改为“如何使用示例 / 如何改网络结构 / 如何加数据集 / 如何扩展”
 
+## 第四轮（never_overwrite 去全局化）
+
+- [x] `import never_overwrite` 不再 patch 任何东西（默认零副作用）
+- [x] 新增 `@protect`（函数级作用域）、`protect_scope(only=...)`（代码块级，可限定路径）、
+      `@protect_paths("path")`（只备份参数，完全不改 `open`）
+- [x] 全局 patch 改为显式 `install()` 或 `DLT_NEVER_OVERWRITE=1`
+- [x] 示例 `train_demo.py` 改用 `@protect_paths("path")`
+
 ## 第二轮（性能与资源）
 
 - [x] PPO：`rewards` 改 deque、replay buffer 按 `rollout_steps` drain、rollout 只堆叠/算 GAE 一次
@@ -37,7 +45,8 @@
 
 1. **包名 `dlt`**，根目录保留同名 shim，兼顾“复制文件即用”和“正经 import”。
 2. **导入零副作用**：`dlt/__init__.py` 不启动 Ray、不 patch `open`；
-   `never_overwrite` 只有显式 import 子模块才生效。
+   `never_overwrite` 导入时不安装任何东西，靠 `@protect` / `protect_scope` /
+   `@protect_paths` / 显式 `install()` 按需开启。
 3. **原子写贯穿始终**：日志/配置用临时文件 + `os.replace`，从而与 `never_overwrite`
    解耦（不会每次保存都产生 `.bak`）。
 4. **防覆盖始终备份**，不再按剩余磁盘空间决定是否备份。

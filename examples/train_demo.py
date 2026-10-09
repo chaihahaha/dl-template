@@ -23,10 +23,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-# Importing this patches open/torch.save so a re-run can never destroy a
-# previous checkpoint or log.
-import dlt.never_overwrite as _never_overwrite  # noqa: F401
 from dlt import ExperimentNamer, YamlLogger
+from dlt.never_overwrite import protect_paths
 from dlt.plot_utils import packplot
 
 
@@ -58,6 +56,19 @@ def plot_loss(history, filename, title="training loss"):
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
+
+
+@protect_paths("path")
+def save_checkpoint(state, path):
+    """Save a checkpoint, backing up any existing file at ``path`` first.
+
+    ``@protect_paths`` backs up the named path argument before the call and does
+    **not** monkey-patch ``open``, so unrelated libraries are unaffected.
+    ``torch.save`` bypasses Python's ``open``, which is exactly why the
+    decorator works on the path instead.
+    """
+    torch.save(state, path)
+    return path
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -121,7 +132,7 @@ def main(argv: list[str] | None = None) -> Path:
             # Checkpoint: a second run of this script backs it up instead of
             # silently destroying it (torch.save is wrapped by never_overwrite).
             ckpt = run.ckpts / "final.pt"
-            torch.save({"model": model.state_dict(), "config": config}, ckpt)
+            save_checkpoint({"model": model.state_dict(), "config": config}, path=ckpt)
             log.add_artifact(ckpt)
 
             figure = run.figures / "loss.png"

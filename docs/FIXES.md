@@ -144,3 +144,21 @@ pickle 能装下任意对象（整个数据集、打开的文件、密钥），�
 | 14 | 需要精细控制 | 无接口 | `packplot(include=..., exclude=..., limits=EncodeLimits(...))` |
 
 依赖变化：`plot_utils` 现在**只依赖 Pillow**（不再需要 dill）。
+
+---
+
+# 第四轮：`never_overwrite` 改成按需、非侵入式
+
+问题：在 import 时全局 patch `builtins.open` 会波及进程内所有代码，第三方包正常的
+`write_text`/临时文件也会触发备份逻辑。改为默认零副作用 + 装饰器/作用域按需开启。
+
+| # | 旧行为 | 问题 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | `import never_overwrite` 即全局 patch `open`/`io.open` | 所有包、所有写入都被拦，产生无关 `.bak` | 导入**无副作用**；默认用原生 `open` |
+| 2 | 只能全局开/关 | 无法只保护某段代码/某个文件 | `@protect` / `with protect_scope(...)` 进入时装、退出即还原 |
+| 3 | 无法限定范围 | 作用域内第三方库的无关写入也会被备份 | `only=[文件/目录/谓词]` 过滤，只保护指定目标 |
+| 4 | `torch.save` 需 `protect_torch()` 全局包装 | 又是一处全局改动 | 新增 `@protect_paths("path")`：调用前备份指定参数，**完全不改 `open`** |
+| 5 | 环境变量 `DLT_NEVER_OVERWRITE` 默认开启 | 容易在不知情时全局生效 | 默认关闭；`DLT_NEVER_OVERWRITE=1` 才在导入时全局安装 |
+| 6 | `uninstall()` 与作用域无协作 | —— | 作用域嵌套计数，退出时恢复原始 `open`；`install/uninstall` 仍可用 |
+
+根目录 shim `never_overwrite.py` 相应更新，`import never_overwrite` 不再自动生效。
