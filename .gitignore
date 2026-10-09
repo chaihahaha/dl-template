@@ -163,3 +163,27 @@ cython_debug/
 #.idea/
 
 *.backup
+
+# ---------------------------------------------------------------------------
+# Project-generated directories and files (see AGENTS.md)
+# ---------------------------------------------------------------------------
+/tmp/
+/runs/
+/logs/
+/data/
+/datasets/
+/models/
+/ckpts/
+/weights/
+/outputs/
+/results/
+/reports/
+/envs/
+/cache/
+/vendor/
+/backups/
+/archive/
+/state/
+*.bak
+*.bak-*
+*.meta

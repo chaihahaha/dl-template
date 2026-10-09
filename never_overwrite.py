@@ -1,20 +1,32 @@
-import os
-import time
-import builtins
-import uuid
-import pathlib
-import shutil
+"""Backwards-compatible shim.
 
-original_open = builtins.open
+The original template told you to put ``import never_overwrite`` on the first
+line of your training script.  That still works: importing this module enables
+the protection implemented in :mod:`dlt.never_overwrite`.
 
-def safe_open(filename, mode='r', **kwargs):
-    if 'w' in mode and os.path.isfile(filename) and shutil.disk_usage('/').free > 2**34:
-        p = pathlib.Path(filename)
-        suffix = f"{os.path.getctime(filename)}_{time.time()}_{uuid.uuid4().hex}"
-        newname = str(p.with_stem(f"{p.stem}_{suffix}"))
-        os.rename(filename, newname)
-    else:
-        newname = filename
-    return original_open(filename, mode=mode, **kwargs)
+New code can equivalently write::
 
-builtins.open = safe_open
+    import dlt.never_overwrite   # noqa: F401  (import for the side effect)
+
+Set ``DLT_NEVER_OVERWRITE=0`` to import without patching ``open``.
+"""
+
+from dlt.never_overwrite import (  # noqa: F401
+    BackupPolicy,
+    backup,
+    install,
+    is_installed,
+    protect_torch,
+    safe_open,
+    uninstall,
+)
+
+__all__ = [
+    "BackupPolicy",
+    "backup",
+    "install",
+    "is_installed",
+    "protect_torch",
+    "safe_open",
+    "uninstall",
+]

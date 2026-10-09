@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlt-template"
+version = "0.2.0"
+description = "Minimalist helpers to bootstrap a deep-learning training project: crash-safe YAML logging, anti-overwrite open, automatic naming, self-describing plots."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "dl-template contributors" }]
+keywords = ["deep-learning", "logging", "reproducibility", "yaml", "template"]
+dependencies = ["PyYAML>=5.4"]
+
+[project.optional-dependencies]
+plot = ["Pillow>=9.0", "dill>=0.3.6"]
+dev = ["pytest>=7.0", "matplotlib>=3.5"]
+
+[tool.setuptools]
+packages = ["dlt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --basetemp=tmp/pytest"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
