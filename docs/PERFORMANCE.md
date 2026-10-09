@@ -61,11 +61,20 @@ def train_get_weights_infos(self):
 只做一次，`sample` 只负责按 `ctx_size`/`batch_size` 取索引（见 `ReplayMemory.sample`
 与 `Worker.train_policy`）。
 
-### 1.4 尚未覆盖的部分
+### 1.4 实测验证
 
-* Ray object store / actor 堆外内存没有实测（本机无 ray/gymnasium，只做了纯
-  PyTorch 部分的回归测试 `tests/test_ppo_memory.py`）。
-* `WorkerCaller` 的 `pending` 列表大小 = worker 数，不增长，无泄漏。
+用 no-op Ray stub 驱动**真实的 `Worker` 类**（Gymnasium Pendulum + 150 轮 rollout/训练）：
+
+```
+replay buffer len  max : 64     (rollout_steps=128，训练后清零)
+reward history len max : 100    (deque maxlen=100)
+peak RSS (MiB)         : [420.4, 424.5, 424.5, 424.5, 424.5]   # warmup 后持平
+```
+
+即缓冲区有界、训练后清空、RSS 不再增长。回归测试见 `tests/test_ppo_worker.py`（无
+Gymnasium 时自动 skip）。
+
+尚未用真实 Ray 多进程跑过；`WorkerCaller.pending` 大小 = worker 数，本身不增长。
 
 ---
 

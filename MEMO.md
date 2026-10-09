@@ -55,7 +55,8 @@
 
 ## 待办 / 可继续改进
 
-- [ ] `examples/rl_ray_ppo.py` 只做了静态检查（环境缺 ray/gymnasium，未实跑）。
+- [ ] `examples/rl_ray_ppo.py` 只用 no-op Ray stub 驱动过真实 `Worker`（缓冲/RSS 有界，
+      见 `tests/test_ppo_worker.py`），尚未用真实 Ray 多进程实跑。
 - [ ] 可选：为 `YamlLogger` 增加 `tensorboard` 导出适配器（不引入硬依赖）。
 - [ ] 可选：`never_overwrite` 支持 `numpy.save`、`safetensors` 等绕过 `open` 的写出 API。
 - [ ] 可选：CI（GitHub Actions）跑 `pytest`。
