@@ -45,6 +45,8 @@ import os
 import platform
 import socket
 import sys
+import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -324,6 +326,13 @@ class YamlLogger:
         whole YAML each time becomes expensive.
     keep_last:
         Keep only the last N values per metric in the YAML (memory friendly).
+    async_save:
+        Run the (potentially expensive) ``yaml_dump`` + file write on a
+        background writer thread.  ``save()`` then only signals the writer, so
+        the training loop never blocks on serialisation.  This matters when a
+        step is short (CPU time spent dumping shows up as GPU idle time) or the
+        metric history is long.  Call :meth:`flush` if you need the file on disk
+        immediately.  Default ``False`` for predictable, synchronous saves.
     """
 
     def __init__(
@@ -346,6 +355,7 @@ class YamlLogger:
         fsync: bool = False,
         flush_stdout: bool = True,
         autosave_atexit: bool = True,
+        async_save: bool = False,
     ) -> None:
         self.name = slugify(name)
         self.save_every = int(save_every)
@@ -392,9 +402,19 @@ class YamlLogger:
         self._log_count = 0
         self._closed = False
         self.flush_stdout = flush_stdout
+        self.async_save = bool(async_save)
+
+        # Guards the mutable log state (main thread appends, writer thread reads).
+        self._lock = threading.RLock()
+        # Background writer state (only used when async_save is enabled).
+        self._writer: threading.Thread | None = None
+        self._writer_cv = threading.Condition()
+        self._save_requested = False
+        self._writing = False
+        self._write_error: Exception | None = None
 
         if autosave_atexit:
-            atexit.register(self.save)
+            atexit.register(self._finalize)
         _LOG.debug("experiment %s logging to %s", self.experiment_id, self.path)
 
     # -- metadata -------------------------------------------------------- #
@@ -404,26 +424,31 @@ class YamlLogger:
 
     def set_config(self, config: Mapping[str, Any]) -> None:
         """Replace/merge the configuration mapping."""
-        self.config.update(dict(config))
+        with self._lock:
+            self.config.update(dict(config))
 
     def update(self, mapping: Mapping[str, Any]) -> None:
         """Merge arbitrary top-level keys into the log (advanced)."""
-        self.extra.update(dict(mapping))
+        with self._lock:
+            self.extra.update(dict(mapping))
 
     def add_info(self, message: str) -> None:
         """Append a free-form human-readable line to the ``info`` list."""
-        self.info.append(f"[{utcnow().isoformat()}] {message}")
+        with self._lock:
+            self.info.append(f"[{utcnow().isoformat()}] {message}")
 
     # alias
     info_msg = add_info
 
     def add_event(self, name: str, **fields: Any) -> None:
-        self.events.append({"time": utcnow().isoformat(), "name": name, **fields})
+        with self._lock:
+            self.events.append({"time": utcnow().isoformat(), "name": name, **fields})
 
     def add_artifact(self, path: str | os.PathLike[str]) -> None:
         entry = os.fspath(path)
-        if entry not in self.artifacts:
-            self.artifacts.append(entry)
+        with self._lock:
+            if entry not in self.artifacts:
+                self.artifacts.append(entry)
 
     # -- metrics --------------------------------------------------------- #
     def log(self, metrics: Mapping[str, Any] | None = None, /, **kwargs: Any) -> "YamlLogger":
@@ -439,28 +464,37 @@ class YamlLogger:
         record.update(kwargs)
         if not record:
             return self
-        for key, value in record.items():
-            key = str(key)
-            scalar = self._coerce(value)
-            self.metrics.setdefault(key, []).append(scalar)
-            if self.keep_last is not None and len(self.metrics[key]) > self.keep_last:
-                del self.metrics[key][: len(self.metrics[key]) - self.keep_last]
-            self.latest[key] = scalar
-        if "step" in record:
-            try:
-                self.step = int(record["step"])
-            except (TypeError, ValueError):
-                self.step = record["step"]  # type: ignore[assignment]
-        self._log_count += 1
+        with self._lock:
+            for key, value in record.items():
+                key = str(key)
+                scalar = self._coerce(value)
+                self.metrics.setdefault(key, []).append(scalar)
+                if self.keep_last is not None and len(self.metrics[key]) > self.keep_last:
+                    del self.metrics[key][: len(self.metrics[key]) - self.keep_last]
+                self.latest[key] = scalar
+            if "step" in record:
+                try:
+                    self.step = int(record["step"])
+                except (TypeError, ValueError):
+                    self.step = record["step"]  # type: ignore[assignment]
+            self._log_count += 1
+            log_count = self._log_count
         if self.jsonl_metrics:
             self._append_jsonl(record)
-        if self.save_every and self._log_count % self.save_every == 0:
+        if self.save_every and log_count % self.save_every == 0:
             self.save()
         return self
 
     @staticmethod
     def _coerce(value: Any) -> Any:
-        """Make a metric value YAML/JSON friendly (unwrap 0-d tensors/arrays)."""
+        """Make a metric value YAML/JSON friendly (unwrap 0-d tensors/arrays).
+
+        .. warning::
+            For a **CUDA** tensor this calls ``.cpu().item()``, which
+            synchronises the device.  Calling it every micro-step therefore
+            makes the GPU wait for the CPU.  Log scalars that are already plain
+            Python floats in the hot loop, or log less frequently.
+        """
         if isinstance(value, (bool, int, float, str)) or value is None:
             return value
         try:
@@ -495,73 +529,148 @@ class YamlLogger:
 
     # -- serialisation --------------------------------------------------- #
     def snapshot(self) -> dict[str, Any]:
-        """Return the full log as a plain dict."""
-        data: dict[str, Any] = {
-            "experiment": {
-                "id": self.experiment_id,
-                "name": self.name,
-                "created_at": self.created_at.isoformat(),
-                "updated_at": utcnow().isoformat(),
-                "save_count": self._save_count,
-                "log_count": self._log_count,
-                "path": str(self.path),
-            },
-            "system": self._system,
-        }
-        if self._packages:
-            data["packages"] = self._packages
-        if self.run is not None:
-            data["run_dir"] = str(self.run.run_dir)
-        if self._git:
-            data["git"] = self._git
-        if self._code:
-            data["code"] = self._code
-        if self._env is not None:
-            data["env"] = self._env
-        data["config"] = dict(self.config)
-        data["step"] = self.step
-        data["latest"] = dict(self.latest)
-        data["metrics"] = {k: list(v) for k, v in self.metrics.items()}
-        data["info"] = list(self.info)
-        data["events"] = list(self.events)
-        if self.artifacts:
-            data["artifacts"] = list(self.artifacts)
-        data.update(self.extra)
-        return data
+        """Return the full log as a plain dict (thread-safe copy)."""
+        with self._lock:
+            data: dict[str, Any] = {
+                "experiment": {
+                    "id": self.experiment_id,
+                    "name": self.name,
+                    "created_at": self.created_at.isoformat(),
+                    "updated_at": utcnow().isoformat(),
+                    "save_count": self._save_count,
+                    "log_count": self._log_count,
+                    "path": str(self.path),
+                },
+                "system": self._system,
+            }
+            if self._packages:
+                data["packages"] = self._packages
+            if self.run is not None:
+                data["run_dir"] = str(self.run.run_dir)
+            if self._git:
+                data["git"] = self._git
+            if self._code:
+                data["code"] = self._code
+            if self._env is not None:
+                data["env"] = self._env
+            data["config"] = dict(self.config)
+            data["step"] = self.step
+            data["latest"] = dict(self.latest)
+            data["metrics"] = {k: list(v) for k, v in self.metrics.items()}
+            data["info"] = list(self.info)
+            data["events"] = list(self.events)
+            if self.artifacts:
+                data["artifacts"] = list(self.artifacts)
+            data.update(self.extra)
+            return data
 
-    def save(self, *, raise_on_error: bool = False) -> Path:
-        """Atomically write the whole log to :attr:`path`."""
-        if self._closed:
-            return self.path
+    def _write_snapshot(self, snapshot: Mapping[str, Any], *, raise_on_error: bool = False) -> None:
+        """Serialise and atomically write one already-copied snapshot."""
         try:
-            text = yaml_dump(self.snapshot())
+            text = yaml_dump(snapshot)
             atomic_write_text(self.path, text, fsync=self.fsync)
-            self._save_count += 1
+            with self._lock:
+                self._save_count += 1
+                self._write_error = None
         except Exception as exc:
+            with self._lock:
+                self._write_error = exc
             _LOG.error("failed to save log to %s: %s", self.path, exc)
             if raise_on_error:
                 raise
-            return self.path
+            return
         if self.flush_stdout:
             try:
                 sys.stdout.flush()
             except Exception:
                 pass
+
+    def _ensure_writer(self) -> None:
+        if self._writer is None:
+            self._writer = threading.Thread(
+                target=self._writer_loop, name="dlt-yaml-writer", daemon=True
+            )
+            self._writer.start()
+
+    def _writer_loop(self) -> None:
+        while True:
+            with self._writer_cv:
+                while not self._save_requested and not self._closed:
+                    self._writer_cv.wait()
+                if not self._save_requested and self._closed:
+                    return
+                # Coalesce: several save() calls while we were busy collapse
+                # into a single write of the newest state.
+                self._save_requested = False
+                self._writing = True
+            try:
+                self._write_snapshot(self.snapshot())
+            finally:
+                with self._writer_cv:
+                    self._writing = False
+                    self._writer_cv.notify_all()
+
+    def save(self, *, raise_on_error: bool = False) -> Path:
+        """Write the whole log to :attr:`path` (asynchronously if enabled)."""
+        if self._closed:
+            return self.path
+        if self.async_save:
+            self._ensure_writer()
+            with self._writer_cv:
+                self._save_requested = True
+                self._writer_cv.notify()
+            if raise_on_error and self._write_error is not None:
+                raise self._write_error
+            return self.path
+        self._write_snapshot(self.snapshot(), raise_on_error=raise_on_error)
         return self.path
 
+    def flush(self, timeout: float | None = None) -> Path:
+        """Block until pending asynchronous writes have reached the disk."""
+        if not self.async_save:
+            return self.path
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._writer_cv:
+            while self._save_requested or self._writing:
+                if deadline is None:
+                    self._writer_cv.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._writer_cv.wait(remaining)
+        return self.path
+
+    def _finalize(self) -> None:
+        """atexit hook: make sure the last state was written."""
+        try:
+            self.save()
+            self.flush(timeout=10)
+        except Exception:  # pragma: no cover - never raise during shutdown
+            pass
+
     def close(self) -> Path:
-        """Final save and detach the ``atexit`` hook."""
-        path = self.save()
+        """Final save, wait for the writer and detach the ``atexit`` hook."""
+        if self.async_save:
+            self.save()
+            self.flush()
+            with self._writer_cv:
+                self._closed = True
+                self._writer_cv.notify_all()
+            if self._writer is not None:
+                self._writer.join(timeout=5)
+        else:
+            self.save()
+            self._closed = True
         if self._jsonl_handle is not None:
             try:
                 self._jsonl_handle.close()
             except Exception:
                 pass
             self._jsonl_handle = None
-        self._closed = True
         with contextlib.suppress(Exception):
-            atexit.unregister(self.save)
-        return path
+            atexit.unregister(self._finalize)
+        return self.path
 
     # -- context manager / error handling -------------------------------- #
     def __enter__(self) -> "YamlLogger":
@@ -573,6 +682,7 @@ class YamlLogger:
         elif exc is not None:
             self.add_info("".join(traceback.format_exception(exc_type, exc, tb)))
         self.save()
+        self.flush()
         return False  # never swallow exceptions
 
     @contextlib.contextmanager
@@ -583,11 +693,13 @@ class YamlLogger:
         except KeyboardInterrupt:
             self.add_info("KeyboardInterrupt")
             self.save()
+            self.flush()
             if reraise:
                 raise
         except BaseException as exc:  # noqa: BLE001 - logging should see everything
             self.add_info("exception: " + "".join(traceback.format_exception_only(type(exc), exc)))
             self.save()
+            self.flush()
             if reraise:
                 raise
 

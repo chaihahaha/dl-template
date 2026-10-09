@@ -130,3 +130,37 @@ def yaml_load_text(path: Path) -> str:
 
 def test_latest_log_missing_dir(tmp_path: Path) -> None:
     assert latest_log(tmp_path / "nope") is None
+
+
+def test_async_save_coalesces_and_flush_persists(tmp_path: Path) -> None:
+    log = YamlLogger("async", logdir=tmp_path, save_every=1, async_save=True)
+    for i in range(100):
+        log.log(loss=float(i))
+    log.flush()
+    data = load_log(log.path)
+    assert data["latest"]["loss"] == 99.0
+    assert data["metrics"]["loss"][-1] == 99.0
+    log.close()
+    assert load_log(log.path)["metrics"]["loss"] == [float(i) for i in range(100)]
+
+
+def test_async_context_manager_flushes_on_exit(tmp_path: Path) -> None:
+    with YamlLogger("async", logdir=tmp_path, save_every=0, async_save=True) as log:
+        log.log(loss=1.5)
+        log.add_info("hi")
+    assert log.path.is_file()
+    data = load_log(log.path)
+    assert data["latest"]["loss"] == 1.5
+    assert any(line.endswith("hi") for line in data["info"])
+
+
+def test_async_write_error_is_recorded(tmp_path: Path) -> None:
+    target_dir = tmp_path / "a-directory"
+    target_dir.mkdir()
+    log = YamlLogger("async-err", logdir=tmp_path, save_every=0, async_save=True)
+    log.log(loss=1.0)
+    log.path = target_dir  # replacing a directory with a file must fail
+    log.save()
+    log.flush()
+    assert log._write_error is not None
+    log.close()

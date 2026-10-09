@@ -25,11 +25,17 @@ Fixes applied compared with the original
 * The worker pump can be stopped; the training loop handles ``Ctrl+C`` and
   shuts the cluster down.
 * Reward averaging and hyper-parameters come from ``argparse``.
+* **Bounded memory** (second pass): ``self.rewards`` is a ``deque(maxlen=100)``
+  instead of an ever-growing list; the replay buffer is drained on a
+  ``rollout_steps`` cadence rather than an episode-length condition (short
+  episodes used to make it grow forever); and the rollout is stacked / GAE is
+  computed once per training pass instead of once per PPO minibatch.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import time
 
 import numpy as np
@@ -92,28 +98,29 @@ class ReplayMemory:
         self.done = []
         self.value = []
 
-    def sample(self, ctx_size, batch_size, last_value, device):
-        size = len(self.r)
-        index = np.random.choice(range(ctx_size - 1, size), batch_size)
+    def __len__(self):
+        return len(self.r)
 
-        returns, advantages = compute_advantages(self.r, self.done, self.value + [last_value])
-        returns = returns[index]
-        advantages = advantages[index]
+    def arrays(self):
+        """Stack the rollout once (instead of once per PPO minibatch)."""
+        return (
+            np.asarray(self.obs, dtype=np.float32),
+            np.asarray(self.act, dtype=np.float32),
+            np.asarray(self.act_logprob, dtype=np.float32),
+        )
 
-        obs_np = np.array(self.obs)
-        act_np = np.array(self.act)
-        act_logprob_np = np.array(self.act_logprob)
-        obs_ctx = []
-        for ctx_idx in range(ctx_size - 1, -1, -1):
-            obs_ctx.append(obs_np[index - ctx_idx])
-        obs_ctx = np.stack(obs_ctx, axis=1)
-
+    def sample(self, ctx_size, batch_size, obs_np, act_np, act_logprob_np, returns, advantages, device):
+        index = np.random.choice(range(ctx_size - 1, len(self.r)), batch_size)
+        obs_ctx = np.stack(
+            [obs_np[index - ctx_idx] for ctx_idx in range(ctx_size - 1, -1, -1)],
+            axis=1,
+        )
         return (
             torch.as_tensor(obs_ctx, dtype=self.dtype, device=device),
             torch.as_tensor(act_np[index], dtype=self.dtype, device=device),
             torch.as_tensor(act_logprob_np[index], dtype=self.dtype, device=device),
-            torch.as_tensor(returns, dtype=self.dtype, device=device),
-            torch.as_tensor(advantages, dtype=self.dtype, device=device),
+            torch.as_tensor(returns[index], dtype=self.dtype, device=device),
+            torch.as_tensor(advantages[index], dtype=self.dtype, device=device),
         )
 
 
@@ -226,6 +233,7 @@ def _build_worker_class(ray):
 
             self.batch_size = params["batch_size"]
             self.ctx_size = params["ctx_size"]
+            self.rollout_steps = params.get("rollout_steps", 128)
             self.dtype = params["dtype"]
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.env = gym.make("Pendulum-v1")
@@ -240,8 +248,14 @@ def _build_worker_class(ray):
             self.memory = ReplayMemory(self.dtype)
             self.context = Context(self.ctx_size, self.d_obs, self.dtype)
             self.T = 0
-            self.rewards = [0.0]
+            # Bounded reward history: only the recent window is ever used, so a
+            # plain list here used to grow without limit for the whole run.
+            self.rewards = collections.deque(maxlen=100)
             self.done = False
+            # Train every ``rollout_steps`` transitions and then drop the buffer.
+            # Keying the trigger on episode length (the old ``self.T``) meant the
+            # buffer was never cleared for short episodes -> unbounded growth.
+            self.steps_since_train = 0
 
         def get_info_dims(self):
             return self.d_obs, self.d_act
@@ -250,12 +264,13 @@ def _build_worker_class(ray):
             return {k: v.detach().cpu() for k, v in self.agent.state_dict().items()}
 
         def get_avg_reward(self):
-            return float(np.mean(self.rewards[-4:]))
+            return float(np.mean(list(self.rewards)[-4:])) if self.rewards else 0.0
 
         def train_get_weights_infos(self):
-            if self.T > self.ctx_size:
+            if self.steps_since_train >= self.rollout_steps and len(self.memory) > self.ctx_size:
                 self.train_policy()
                 self.memory.clear()
+                self.steps_since_train = 0
             return self.get_weights(), self.get_avg_reward(), self.context.normalizer.take_collect()
 
         def set_weights(self, weights):
@@ -270,6 +285,9 @@ def _build_worker_class(ray):
             self.context.normalizer.collect_obs(obs)
             self.context.add(obs)
             self.T = 0
+            # Note: ``self.memory`` intentionally survives episode boundaries
+            # (it is cleared after each training pass), so a new episode must
+            # not reset ``steps_since_train``.
 
         def train_policy(self):
             n_batches = max(1, int(self.T / self.batch_size) + 1)
@@ -277,15 +295,30 @@ def _build_worker_class(ray):
             _, _, _, last_value = self.agent(obs_ctx)
             last_value = float(last_value.detach().cpu().reshape(-1)[0])
 
+            # Compute the rollout arrays and GAE once per training pass instead
+            # of once per minibatch (the old code re-stacked and re-computed
+            # them inside every ``sample`` call).
+            obs_np, act_np, act_logprob_np = self.memory.arrays()
+            returns, advantages = compute_advantages(
+                self.memory.r, self.memory.done, self.memory.value + [last_value]
+            )
+
             self.opt.zero_grad()
             for _ in range(n_batches):
                 batch = self.memory.sample(
-                    self.ctx_size, self.batch_size, last_value, self.device
+                    self.ctx_size,
+                    self.batch_size,
+                    obs_np,
+                    act_np,
+                    act_logprob_np,
+                    returns,
+                    advantages,
+                    self.device,
                 )
-                obs_ctxs, acts, act_logprobs, returns, advantages = batch
+                obs_ctxs, acts, act_logprobs, batch_returns, batch_advantages = batch
                 _, _, pred_act_dist, pred_value = self.agent(obs_ctxs)
                 loss = ppo_loss(
-                    pred_act_dist, pred_value, acts, act_logprobs, returns, advantages
+                    pred_act_dist, pred_value, acts, act_logprobs, batch_returns, batch_advantages
                 )
                 (loss / n_batches).backward()
             self.opt.step()
@@ -311,6 +344,7 @@ def _build_worker_class(ray):
                 self.context.add(obs_)
                 self.rewards.append(reward)
                 self.T += 1
+                self.steps_since_train += 1
 
     return Worker
 
@@ -357,6 +391,7 @@ def run_parallel(args):
     params = {
         "batch_size": args.batch_size,
         "ctx_size": args.ctx_size,
+        "rollout_steps": args.rollout_steps,
         "lr": args.lr,
         "dtype": torch.float32,
     }

@@ -56,3 +56,19 @@ sha256[:16] + body`。压缩用 zlib，校验和不匹配立即报错，避免�
 
 `dlt/__init__.py` 导入时不做任何副作用（不启动集群、不 patch `open`），
 `plot_utils` 通过 `__getattr__` 懒加载，因此没装 Pillow 也不影响使用核心功能。
+
+## 日志的同步/异步取舍
+
+默认 `async_save=False`：`save()` 返回时文件一定已经原子落盘，语义最简单、最可预测。
+但 YAML 序列化是 O(历史长度)，在训练线程里做会让 GPU 队列断供。因此提供
+`async_save=True`：`save()` 只置一个“待写”标志，后台线程取最新快照写盘（多次请求自动
+合并），`__exit__`/`close()`/`atexit`/`flush()` 负责等待落盘。线程间通过
+`threading.RLock` 保护 metrics/info/events。
+
+这是“可预测性 vs 吞吐”的显式开关，不替用户做决定；但示例默认开启异步。
+
+## 与第三方框架的关系
+
+核心保持框架无关。需要 Lightning 时，用 `dlt.integrations.lightning.DLTLogger` 把
+`Trainer` 的 metrics/hyper-parameters 接到 `YamlLogger`；这是**可选子包**，不 import 就
+不会引入 lightning 依赖。训练加速（DDP/AMP/累积/compile）仍由 `Trainer` 负责。

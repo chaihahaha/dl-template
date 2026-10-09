@@ -11,9 +11,17 @@
 - [x] 旧根文件改为兼容 shim（`never_overwrite` / `plot_utils` / `yaml_logging`）
 - [x] `rl_ray_ppo.py` → `examples/rl_ray_ppo.py`（现代 gymnasium + 修 bug）
 - [x] `examples/train_demo.py` 端到端示例（已验证可运行）
-- [x] `tests/` 45 个用例全绿
+- [x] `tests/` 60 个用例全绿（含 async 日志、PPO 内存回归、Lightning 集成）
 - [x] `pyproject.toml`、`README.md`、`docs/FIXES.md`、`docs/DESIGN.md`
 - [x] `.gitignore` 补齐 AGENTS.md 要求的目录
+
+## 第二轮（性能与资源）
+
+- [x] PPO：`rewards` 改 deque、replay buffer 按 `rollout_steps` drain、rollout 只堆叠/算 GAE 一次
+- [x] `never_overwrite`：`keep` / `max_total_bytes` / `min_free_bytes`（默认 512 MiB）防写爆盘
+- [x] `YamlLogger`：`async_save` 后台写盘 + 线程锁 + `flush()`（实测阻塞开销 ~40×↓）
+- [x] PyTorch Lightning：`DLTLogger` + `examples/lightning_demo.py`（Lightning 2.6.6 实跑验证）
+- [x] `docs/PERFORMANCE.md`：四个疑问的排查结论与实测数据
 
 ## 关键决策
 

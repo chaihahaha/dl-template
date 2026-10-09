@@ -63,3 +63,36 @@ AGENTS.md 要求所有文件落在项目内。**结论**：`pyproject.toml` 里
 
 `dlt/never_overwrite.py` 在 import 时自动 `install()`（受 `DLT_NEVER_OVERWRITE` 控制）。
 测试里通过 conftest 设 `DLT_NEVER_OVERWRITE=0`，避免整套测试期间 `open` 被全局改写。
+
+---
+
+# 第二轮补充
+
+## 11. `collections.deque` 不支持切片
+
+把无界的 `self.rewards` 列表改成 `deque(maxlen=100)` 后，原来的
+`np.mean(self.rewards[-4:])` 会 `TypeError: sequence index must be integer`。
+必须 `list(...)[-4:]`。回归测试见 `tests/test_ppo_memory.py`。
+
+## 12. 异步保存必须把最后一次写刷出去
+
+`async_save=True` 时 `save()` 只发信号，如果进程在后台线程写完前退出，最后一段日志会丢。
+因此 `__exit__` / `close()` / `catch` 都调用 `flush()`，并且 `atexit` 注册的是
+`_finalize`（save + flush）而不是裸 `save`。多个保存请求会 coalesce 成一次最新快照。
+
+## 13. 备份目录里的 `.bak` 可能被 glob 误加载
+
+`never_overwrite` 把备份留在原目录（`model.bak-<ts>-<id>.pt`）。加载 checkpoint 时若用
+`glob("*.pt")` 可能把备份也扫进去。建议用精确文件名，或设 `backup_dir` 集中存放。
+
+## 14. Lightning 的 `log_every_n_steps` 默认 50
+
+用 2 个 batch 做集成测试时发现日志里 `metrics` 为空——因为 `Trainer` 默认
+`log_every_n_steps=50`，不足 50 步不会调用 `log_metrics`。测试里需显式设
+`log_every_n_steps=1`。
+
+## 15. Lightning 的 dataloader 传参
+
+`train_dataloaders=[(x, y), ...]`（普通 list）会被当成“一个 batch”，训练时报
+`linear(): argument 'input' must be Tensor, not tuple`。要用
+`DataLoader(TensorDataset(...), batch_size=...)`。

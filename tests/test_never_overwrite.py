@@ -112,6 +112,42 @@ def test_disabled_policy_does_not_touch_files(tmp_path: Path) -> None:
     assert target.read_text() == "new"
 
 
+def test_max_total_bytes_bounds_backup_size(tmp_path: Path) -> None:
+    nw.install(policy=BackupPolicy(max_total_bytes=50))
+    target = tmp_path / "m.bin"
+    for _ in range(6):
+        with open(target, "wb") as handle:
+            handle.write(b"x" * 40)
+    kept = backups_of(tmp_path, "m")
+    assert len(kept) == 1  # 40-byte versions, 50-byte budget -> only the newest
+
+
+def test_min_free_bytes_prunes_when_disk_is_low(tmp_path: Path) -> None:
+    # An absurdly high threshold makes the guard fire on every backup.
+    nw.install(policy=BackupPolicy(min_free_bytes=10**18))
+    target = tmp_path / "cap.bin"
+    for _ in range(5):
+        with open(target, "wb") as handle:
+            handle.write(b"y" * 10)
+    # The guard frees previous backups before creating a new one, so the count
+    # stays tiny instead of growing once per write.
+    assert len(backups_of(tmp_path, "cap")) <= 1
+
+
+def test_backups_of_other_files_are_never_pruned_by_keep(tmp_path: Path) -> None:
+    nw.install(policy=BackupPolicy(keep=1))
+    other = tmp_path / "other.txt"
+    other.write_text("other-old")
+    with open(other, "w") as handle:
+        handle.write("other-new")
+    target = tmp_path / "target.txt"
+    for i in range(3):
+        with open(target, "w") as handle:
+            handle.write(str(i))
+    assert len(backups_of(tmp_path, "other")) == 1
+    assert len(backups_of(tmp_path, "target")) == 1
+
+
 def test_torch_save_is_protected(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     import torch

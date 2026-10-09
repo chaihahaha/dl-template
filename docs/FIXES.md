@@ -74,6 +74,46 @@
 * 旧根目录脚本 `rl_ray_ppo.py` 移动到 `examples/rl_ray_ppo.py`。
 * 旧 `never_overwrite.py` / `plot_utils.py` / `yaml_logging.py` 改为转发 shim，
   保证既有 `import never_overwrite` 等写法继续可用。
-* 新增 `pyproject.toml`、`tests/`（45 个用例）、`docs/`。
+* 新增 `pyproject.toml`、`tests/`（60 个用例）、`docs/`。
 * `.gitignore` 补齐 `AGENTS.md` 要求的生成物目录（`/tmp/`、`/runs/`、`/envs/`、`/cache/`
   等）以及 `*.bak`。
+
+---
+
+# 第二轮：性能与资源问题
+
+详见 [`PERFORMANCE.md`](PERFORMANCE.md)。摘要：
+
+## RL PPO 内存（`examples/rl_ray_ppo.py`）
+
+| # | 旧行为 | 问题 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | `self.rewards = [0.0]` 每步 append，永不清理 | **无界内存增长**（只用到最后 4 个） | `collections.deque(maxlen=100)` |
+| 2 | 仅当 `self.T > ctx_size`（episode 长度）才 `memory.clear()` | 短 episode 下 replay buffer **永不清理** | 用 `steps_since_train >= rollout_steps` 触发并 drain |
+| 3 | `sample()` 每个 minibatch 重新 `np.array` 整段 buffer 并重算 GAE | CPU/瞬时内存放大 `n_batches` 倍 | `arrays()` + GAE 每次训练只算一次 |
+| 4 | `np.mean(self.rewards[-4:])` | 换 deque 后切片会 `TypeError` | `list(...)[-4:]` |
+
+## `never_overwrite` 磁盘占用
+
+| # | 旧行为 | 问题 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | 备份默认无上限 | 反复覆盖大文件（如每个 epoch 同一个 `ckpt.pt`）会写爆磁盘 | `keep` / `max_total_bytes` 上限 |
+| 2 | 无磁盘水位保护 | 备份可能把盘写满 | `min_free_bytes`（默认 512 MiB）磁盘吃紧时删最旧备份并 warning |
+| 3 | 只能放在原目录 | 不便统一清理 | `backup_dir` 可集中存放 |
+| 4 | 无环境变量 | 无法快速调参 | `DLT_NEVER_OVERWRITE_KEEP/_MAX_TOTAL_MB/_MIN_FREE_MB` |
+
+## 日志阻塞训练（`dlt/yaml_logging.py`）
+
+| # | 旧行为 | 问题 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | `save()` 在训练线程里 `yaml_dump(全量历史)` + 写盘 | GPU 可能等 CPU（实测 40k 点、`save_every=2000`：2.91s） | `async_save=True` 后台线程写盘（同场景 0.07s），多次保存自动合并 |
+| 2 | 训练线程 append 与写盘并发 | 数据竞争 | `threading.RLock` 保护 metrics/info/events；`snapshot()` 加锁拷贝 |
+| 3 | 退出时异步写可能来不及落盘 | 丢最后一段日志 | `__exit__`/`close()`/`atexit`/`flush()` 都会等待落盘 |
+| 4 | `_coerce` 对 CUDA tensor `.cpu().item()` | 每步强制设备同步 | 文档明确警告；建议记录 Python float / 降低频率 |
+
+## PyTorch Lightning
+
+* 模板本身不用 Lightning，因此谈不上“利用 Trainer 的加速”。
+* 新增 `dlt/integrations/lightning.py`（`DLTLogger`）与 `examples/lightning_demo.py`，
+  可在使用 `Trainer`（DDP / 混合精度 / 梯度累积 / `compile`）的同时获得 dlt 日志。
+* `tests/test_lightning.py` 在 Lightning 2.6.6 上实跑 `Trainer.fit` 验证。

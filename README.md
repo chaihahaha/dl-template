@@ -9,6 +9,7 @@
 | `dlt.never_overwrite` | 把 `open(..., "w")` 改成“先备份再覆盖”，并额外保护 `torch.save` | 无 |
 | `dlt.naming` | 实验/文件自动命名：可排序、人类可读、永不撞名 | 无 |
 | `dlt.plot_utils` | 图片自带“配方”：把画图代码和数据嵌进 PNG/JPEG，随时重新绘制 | Pillow（`dill` 可选） |
+| `dlt.integrations.lightning` | 可选的 PyTorch Lightning `DLTLogger` | lightning 可选 |
 
 > 设计原则：**核心零第三方依赖，重依赖全部可选**。只想要日志时只装 `PyYAML` 即可；
 > 用到画图再装 `Pillow`。
@@ -24,12 +25,17 @@
 │   ├── yaml_logging.py      # YamlLogger
 │   ├── never_overwrite.py   # 防覆盖 open
 │   ├── plot_utils.py        # packplot / retrieve_*
-│   └── _atomic.py           # 原子写（临时文件 + os.replace）
+│   ├── _atomic.py           # 原子写（临时文件 + os.replace）
+│   └── integrations/
+│       └── lightning.py     # 可选：PyTorch Lightning DLTLogger
 ├── examples/
-│   ├── train_demo.py        # 端到端可运行示例（推荐先看）
+│   ├── train_demo.py        # 端到端纯 PyTorch 示例（推荐先看）
+│   ├── lightning_demo.py    # PyTorch Lightning + Trainer 加速示例
 │   └── rl_ray_ppo.py        # Ray 多卡异步 PPO（可选，重依赖）
 ├── tests/                   # pytest 测试
-├── docs/FIXES.md            # 相对旧代码修复了哪些问题
+├── docs/
+│   ├── FIXES.md             # 相对旧代码修复了哪些问题
+│   └── PERFORMANCE.md       # 内存 / 磁盘 / GPU 等待 / Lightning 分析
 ├── never_overwrite.py       # 兼容旧用法的转发文件（import 即生效）
 ├── plot_utils.py            # 兼容旧用法的转发文件
 ├── yaml_logging.py          # 兼容旧用法的转发文件
@@ -105,7 +111,12 @@ code:       {path, sha256, source}         # 本次训练脚本
   避免把密钥写进日志。这修复了旧实现直接 `os.environ` 全量落盘的问题。
 * **NumPy / torch 直接可写**：`np.float32`、0 维 tensor 会自动转成 Python 标量。
 * **长训练可选 `jsonl_metrics=True`**：每个 step 追加一行 JSON 到 `*.jsonl`，避免反复重写整个 YAML。
+* **不阻塞训练**：`async_save=True` 把 YAML 序列化与写盘放到后台线程（实测可把训练线程里
+  的保存开销降低约 40×）。默认 `False` 表示“保存返回即已落盘”。
 * **调试钩子默认关闭**：只有 `DLT_DEBUG=1` 且 stdin 是 TTY 时才会进入 `pdb`，CI 不会卡住。
+
+> ⚠️ 性能细节：对 CUDA tensor 调用 `.cpu().item()` 会同步设备。热循环里请记录已经是
+> Python float 的值，或降低记录频率。详见 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#3-dlt-输出日志会不会让-gpu-等-cpu拖慢训练)。
 
 读取日志：
 
@@ -141,11 +152,16 @@ with open("result.csv", "w") as fh:   # result.csv -> result.bak-20261010T002915
   `dlt.never_overwrite.protect_torch()`（若 import 时 torch 已加载则自动完成）。
 * `"a"`（追加）和 `"x"`（独占创建）不会丢数据，不做备份。
 * 符号链接跳过备份并记录日志（移动链接会改变语义）。
-* 空文件不备份；`backup_dir` 可把备份集中到某个目录；`keep=N` 可只保留最近 N 份。
+* 空文件不备份；`backup_dir` 可把备份集中到某个目录。
+* **防止写爆硬盘**（重要）：反复覆盖同一个大文件会累积备份。可用
+  `keep=N`（每个文件最多 N 份）、`max_total_bytes=B`（备份总量上限）、
+  `min_free_bytes=B`（默认 512 MiB，磁盘快满时自动删最旧的备份并 warning）。
+  对应环境变量 `DLT_NEVER_OVERWRITE_KEEP / _MAX_TOTAL_MB / _MIN_FREE_MB`。
 * 用环境变量关闭：`DLT_NEVER_OVERWRITE=0`。
 
 与旧实现的区别（重要）：旧代码只在根分区剩余空间 > 16 GiB 时才备份，否则**静默覆盖**；
-而 `os.replace` 同目录改名几乎不占额外空间，所以新实现**始终备份**。
+而 `os.replace` 同目录改名几乎不占额外空间，所以新实现**始终备份**（并额外提供上面的
+磁盘上限保护）。详见 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md#2-never_overwrite-在某些情况下会不会把硬盘写爆)。
 
 ## 3. 自动命名 `naming`
 
@@ -190,6 +206,40 @@ retrieve_plot("loss.png", allow_execute=True)   # 重新画一张
 * **安全**：`retrieve_plot` 会执行图片里的代码，必须显式 `allow_execute=True`；
   只想看内容请用 `retrieve_code` / `retrieve_data` / `unpack`。
 
+## 5. PyTorch Lightning（可选集成）
+
+`dlt` 核心不参与训练；Lightning 的加速（DDP/FSDP、混合精度、梯度累积、
+`torch.compile`、梯度裁剪等）来自 `Trainer`。用 `DLTLogger` 可以把两者结合：
+
+```python
+from lightning.pytorch import Trainer
+from dlt.integrations.lightning import DLTLogger
+
+trainer = Trainer(
+    logger=DLTLogger("resnet50", save_dir="runs", save_every=100, async_save=True),
+    accelerator="gpu", devices=4, strategy="ddp",
+    precision="16-mixed",          # 或 bf16-mixed（Ampere+）
+    accumulate_grad_batches=2,
+    # compile=True,                # torch>=2.0
+)
+trainer.fit(model, datamodule=dm)
+```
+
+可运行示例见 `examples/lightning_demo.py`（默认 CPU，注释里给出加速开关）。
+
+---
+
+## 性能与资源
+
+四个常见疑问的排查结论（内存泄漏 / 备份写爆磁盘 / GPU 等待日志 / Lightning 加速）
+汇总在 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)，要点：
+
+* RL PPO 示例原有的 `rewards` 列表与短 episode 下的 replay buffer 会无界增长，**已修复**。
+* `never_overwrite` 反复覆盖大文件确实可能写爆磁盘，已加 `keep` / `max_total_bytes` /
+  `min_free_bytes` 三道防线。
+* 同步保存会阻塞训练线程（实测 40k 点、`save_every=2000` 时约 2.9s），
+  `async_save=True` 降到约 0.07s；另外避免每步对 CUDA tensor 调 `.item()`。
+
 ---
 
 ## 测试
@@ -201,4 +251,5 @@ python -m pytest -q
 ## 进一步阅读
 
 * [`docs/FIXES.md`](docs/FIXES.md)：本次重构修复的完整问题清单。
+* [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)：内存 / 磁盘 / GPU 等待 / Lightning 分析。
 * [`docs/DESIGN.md`](docs/DESIGN.md)：关键设计决策与取舍。

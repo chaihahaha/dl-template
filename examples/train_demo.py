@@ -93,7 +93,16 @@ def main(argv: list[str] | None = None) -> Path:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
 
-    with YamlLogger(args.name, run=run, config=config, save_every=10, log_git=True) as log:
+    with YamlLogger(
+        args.name,
+        run=run,
+        config=config,
+        save_every=10,
+        log_git=True,
+        # Serialise the YAML on a background thread so a slow save never stalls
+        # the training loop (and therefore the GPU).
+        async_save=True,
+    ) as log:
         with log.catch():
             history: list[float] = []
             for epoch in range(1, args.epochs + 1):
