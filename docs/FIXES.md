@@ -117,3 +117,30 @@
 * 新增 `dlt/integrations/lightning.py`（`DLTLogger`）与 `examples/lightning_demo.py`，
   可在使用 `Trainer`（DDP / 混合精度 / 梯度累积 / `compile`）的同时获得 dlt 日志。
 * `tests/test_lightning.py` 在 Lightning 2.6.6 上实跑 `Trainer.fit` 验证。
+
+---
+
+# 第三轮：`plot_utils` 极端情况加固
+
+核心改动：**payload 从 pickle/dill 换成有大小上限的、白名单式的 JSON（版本 2）**。
+pickle 能装下任意对象（整个数据集、打开的文件、密钥），而且反序列化本身就会执行代码，
+所以“读取端安全”是假的。JSON 可以测量/限制大小、脱敏、按固定白名单解码。
+
+| # | 极端情况 | 旧行为 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | 画图函数把结果写到了**非图片**文件（`.txt`/`.csv`/`.pt`） | 在文件旁写 `.meta`，等于污染非代码文件 | 识别到不是可读图片就 **raise**，文件保持原样、不写 sidecar |
+| 2 | 参数是**大数组/大 tensor**（如整个数据集） | 直接序列化进 EXIF/PNG，图片可达数 GB | `max_arg_bytes`（默认 256 KiB）超出则存 shape/dtype/统计量摘要 |
+| 3 | 参数是**大 bytes/长字符串** | 全量嵌入 | 超过 `max_bytes`/`max_string` 只存长度 + SHA-256 摘要 |
+| 4 | 参数总量过大 | 无上限 | `max_payload_bytes`（默认 2 MiB），按大小从大到小用 `omitted` 占位 |
+| 5 | 参数含**密钥/Token** | 原样嵌入 | 敏感键名（TOKEN/SECRET/PASSWORD/...）自动 `<redacted>` |
+| 6 | **递归/超深/超长容器** | 可能递归爆栈或巨大 payload | 深度、元素数、`id()` 环检测，超限转摘要 |
+| 7 | **不受支持的对象**（模块、文件句柄、模型、函数） | 依赖 pickle 成败 | 统一存 `type` + 截断 `repr` 摘要并记 warning |
+| 8 | PNG 里嵌入任意大小 payload | 无硬上限 | `_MAX_EMBED_BYTES`（8 MiB）超出转 sidecar；JPEG EXIF 仍受 60 KB 限制 |
+| 9 | **zip bomb**：篡改压缩流声明超大解压尺寸 | 直接 `zlib.decompress` | 解压前检查声明大小、`decompressobj` 限制最大输出并校验 |
+| 10 | 读取端 `retrieve_data/retrieve_code` | 实际会 `pickle.loads`（可执行代码） | 只解析 JSON，**不执行任何代码**；只有 `retrieve_plot(allow_execute=True)` 执行源码 |
+| 11 | 旧版（v1）pickle payload | 直接加载 | 默认拒绝，需显式 `unpack(path, allow_pickle=True)` |
+| 12 | `filename` 是**符号链接** | `os.replace` 会把链接替换成普通文件 | 先 `realpath`，写目标文件，保留链接 |
+| 13 | 源码函数过大 | 全量嵌入 | `max_code`（默认 200 KB）截断 |
+| 14 | 需要精细控制 | 无接口 | `packplot(include=..., exclude=..., limits=EncodeLimits(...))` |
+
+依赖变化：`plot_utils` 现在**只依赖 Pillow**（不再需要 dill）。

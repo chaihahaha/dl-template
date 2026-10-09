@@ -6,6 +6,7 @@ Prefer ``from dlt.plot_utils import packplot, retrieve_plot, retrieve_data`` or
 
 from dlt.plot_utils import (  # noqa: F401
     KEY,
+    EncodeLimits,
     PlotBundle,
     embed_metadata,
     extract_metadata,
@@ -18,6 +19,7 @@ from dlt.plot_utils import (  # noqa: F401
 
 __all__ = [
     "KEY",
+    "EncodeLimits",
     "PlotBundle",
     "embed_metadata",
     "extract_metadata",

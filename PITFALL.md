@@ -96,3 +96,35 @@ AGENTS.md 要求所有文件落在项目内。**结论**：`pyproject.toml` 里
 `train_dataloaders=[(x, y), ...]`（普通 list）会被当成“一个 batch”，训练时报
 `linear(): argument 'input' must be Tensor, not tuple`。要用
 `DataLoader(TensorDataset(...), batch_size=...)`。
+
+---
+
+# 第三轮补充
+
+## 16. pickle 不是“只读”，它本身就会执行代码
+
+`plot_utils` 原本用 pickle/dill 存参数，`retrieve_data` 看起来只是“读数据”，实际上
+`pickle.loads` 遇到恶意 `__reduce__` 就会执行任意代码。所以“只有 `retrieve_plot` 危险”
+的说法是错的。已改为白名单 JSON（v2），读取端只做 JSON 解析；v1 pickle payload 默认拒绝。
+
+## 17. pickle 无法限制大小，会把整个数据集塞进图片
+
+用 pickle 时只能在序列化*之后*才知道多大；大数组/大 bytes 会被整个写进 PNG/EXIF。
+JSON 编码可以在类型层面先看 `nbytes`/`len`，超限直接转摘要。这是“会不会把大文件写进
+exif”的根本修复。
+
+## 18. `except Exception: 写 sidecar` 会污染非图片文件
+
+原 `embed_metadata` 只要 `Image.open` 失败就走 sidecar，于是画图函数误写 `.csv`/`.pt`
+也会在它旁边生成 `.meta`。现在先用 `_image_format` 判断：不是可读图片就 raise，绝不碰该
+文件；只有“是图片但格式不支持元信息”（TIFF/BMP）才用 sidecar。
+
+## 19. `os.replace` 会吃掉符号链接
+
+对符号链接调用 `os.replace(tmp, link)` 会把链接本身替换成普通文件。改为先
+`os.path.realpath()` 再替换目标，链接保持不动。
+
+## 20. zlib 解压要防 zip bomb
+
+解压前检查 header 声明的 `raw_len`，再用 `decompressobj().decompress(data, max_length)`
+限制最大输出并检查 `unconsumed_tail`，避免攻击者用小文件解压出巨量内存。

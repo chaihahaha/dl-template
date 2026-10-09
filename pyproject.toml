@@ -14,7 +14,7 @@ keywords = ["deep-learning", "logging", "reproducibility", "yaml", "template"]
 dependencies = ["PyYAML>=5.4"]
 
 [project.optional-dependencies]
-plot = ["Pillow>=9.0", "dill>=0.3.6"]
+plot = ["Pillow>=9.0"]
 lightning = ["lightning>=2.0"]
 dev = ["pytest>=7.0", "matplotlib>=3.5"]
 

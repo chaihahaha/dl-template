@@ -11,9 +11,19 @@
 - [x] 旧根文件改为兼容 shim（`never_overwrite` / `plot_utils` / `yaml_logging`）
 - [x] `rl_ray_ppo.py` → `examples/rl_ray_ppo.py`（现代 gymnasium + 修 bug）
 - [x] `examples/train_demo.py` 端到端示例（已验证可运行）
-- [x] `tests/` 60 个用例全绿（含 async 日志、PPO 内存回归、Lightning 集成）
+- [x] `tests/` 71 个用例全绿（含 async 日志、PPO 内存回归、plot 极端情况、Lightning 集成）
 - [x] `pyproject.toml`、`README.md`、`docs/FIXES.md`、`docs/DESIGN.md`
 - [x] `.gitignore` 补齐 AGENTS.md 要求的目录
+
+## 第三轮（plot_utils 加固 + README 精简）
+
+- [x] payload 从 pickle/dill 换成**有大小上限的 JSON（v2）**：大数组/大 bytes/超长字符串
+      转摘要，总预算超出按大小 omitted，敏感键脱敏，递归/超深容器保护
+- [x] 非图片输出直接 raise（不再往非代码文件旁写 `.meta`）；符号链接写目标不破坏链接
+- [x] zip-bomb 防护；v1 pickle payload 默认拒绝（`allow_pickle=True` 才读）
+- [x] `retrieve_data` / `retrieve_code` 现在只解析 JSON，**不会执行代码**
+- [x] plot 只依赖 Pillow（移除 dill）；新增 `EncodeLimits`、`include`/`exclude`
+- [x] README 改为“如何使用示例 / 如何改网络结构 / 如何加数据集 / 如何扩展”
 
 ## 第二轮（性能与资源）
 

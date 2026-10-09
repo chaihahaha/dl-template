@@ -7,7 +7,7 @@ library plus PyYAML for logging.  Heavy helpers are imported lazily:
 * :mod:`dlt.yaml_logging`      - crash-safe YAML experiment logger
 * :mod:`dlt.never_overwrite`   - backup-on-truncate ``open`` (import to enable)
 * :mod:`dlt.plot_utils`        - images that carry their own plotting code
-  (needs Pillow, and ``dill``/``matplotlib`` optionally)
+  (needs Pillow; payload is size-bounded JSON)
 
 Example
 -------
@@ -69,6 +69,7 @@ __all__ = [
     "retrieve_plot",
     "retrieve_data",
     "retrieve_code",
+    "EncodeLimits",
 ]
 
 _LAZY_PLOT = {
@@ -78,6 +79,7 @@ _LAZY_PLOT = {
     "retrieve_code",
     "unpack",
     "PlotBundle",
+    "EncodeLimits",
     "embed_metadata",
     "extract_metadata",
 }

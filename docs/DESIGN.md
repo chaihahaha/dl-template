@@ -40,8 +40,11 @@
 | JPEG/WEBP | EXIF `UserComment` | 标准位置；用 `quality="keep"` 尽量减少重编码损失 |
 | 其它 | 同名 `.meta` sidecar | 兜底，绝不丢 payload |
 
-payload 结构：`MAGIC(4) + version(1) + pickle-tag(1) + compressed(1) + raw_len(4) +
-sha256[:16] + body`。压缩用 zlib，校验和不匹配立即报错，避免“读出乱七八糟的东西”。
+payload 结构：`MAGIC(4) + version(1) + 类型/压缩标志(2) + raw_len(4) + sha256[:16] + body`。
+body 是 **JSON**（v2，可选 zlib 压缩）而不是 pickle：JSON 能在编码时就按类型测量并限制
+大小（`nbytes`/`len`）、对敏感键脱敏，解码只需白名单，不会像 `pickle.loads` 那样执行代码。
+读取端限制解压后的大小（防 zip bomb），校验和不匹配立即报错。v1 的 pickle payload 默认
+拒绝，需显式 `allow_pickle=True`。
 
 **安全边界**：图片可被恶意替换，元信息里的代码在 `retrieve_plot` 时会被 `exec`。
 因此默认拒绝执行，必须先 `allow_execute=True`；只读的 `retrieve_code`/`retrieve_data`
@@ -51,7 +54,7 @@ sha256[:16] + body`。压缩用 zlib，校验和不匹配立即报错，避免�
 
 * 核心（`naming`、`_atomic`、`never_overwrite`）：仅标准库；
 * 日志（`yaml_logging`）：+ PyYAML；
-* 画图（`plot_utils`）：+ Pillow，`dill` 可选（支持 lambda/闭包序列化）；
+* 画图（`plot_utils`）：+ Pillow；payload 是**有大小上限的 JSON**（不再用 pickle/dill）；
 * `rl_ray_ppo` 示例：+ ray / gymnasium / torch，属于可选的“重”示例，不参与最小模板。
 
 `dlt/__init__.py` 导入时不做任何副作用（不启动集群、不 patch `open`），
