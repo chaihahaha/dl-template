@@ -162,3 +162,24 @@ pickle 能装下任意对象（整个数据集、打开的文件、密钥），�
 | 6 | `uninstall()` 与作用域无协作 | —— | 作用域嵌套计数，退出时恢复原始 `open`；`install/uninstall` 仍可用 |
 
 根目录 shim `never_overwrite.py` 相应更新，`import never_overwrite` 不再自动生效。
+
+---
+
+# 第五轮：异步 actor-learner 的异策略修正（IMPALA V-trace）
+
+问题：actor 与 learner 异步，buffer 数据由旧策略 `mu` 产生、用新策略 `pi` 训练；PPO 的
+clip/GAE 假设 `mu≈pi`，因此是异策略的，训练会震荡。详见
+[`IMPALA_VTRACE.md`](IMPALA_VTRACE.md)。
+
+| # | 旧行为 | 问题 | 新行为 |
+| --- | --- | --- | --- |
+| 1 | GAE + `ppo_loss`（clip 比例） | 异策略下目标有偏、比例可能爆炸 | `vtrace_targets` + `impala_policy_loss`（截断重要性采样），`--policy-loss ppo` 可选 |
+| 2 | 每个 minibatch 随机采样 | 打断 V-trace 沿时间的迹 | 对整段 rollout 做 `--epochs` 遍 |
+| 3 | `a_dist.log_prob(act)` 只取首个动作维 | 多维动作 log-prob 错误 | `log_prob(act).sum(-1)` 联合 log 概率 |
+| 4 | 跨 episode 直接堆叠上下文 | 上下文混入上一个 episode | `build_contexts(..., dones=...)` 在边界清零 |
+| 5 | 价值头无尺度先验（原代码硬编码 `/0.05`） | 价值比目标小两个数量级 | `value_scale = 1/(1-gamma)`，显式且随 gamma |
+| 6 | 优势未归一化 | 梯度尺度不稳 | `--normalize-advantages`（默认开，仿射标准化） |
+| 7 | 无 `rho_bar/c_bar/gamma/epochs` 参数 | 无法调异策略容忍度 | 全部走 argparse |
+
+新增 `tests/test_vtrace.py`：与论文公式的 O(T²) 直接实现逐步对齐、on-policy 退化、截断、
+done 边界、空输入/长度校验、损失梯度与裁剪。全套 93 个用例通过。

@@ -129,3 +129,32 @@ exif”的根本修复。
 
 解压前检查 header 声明的 `raw_len`，再用 `decompressobj().decompress(data, max_length)`
 限制最大输出并检查 `unconsumed_tail`，避免攻击者用小文件解压出巨量内存。
+
+---
+
+# 第五轮补充
+
+## 21. V-trace 的迹不能按 minibatch 打乱
+
+V-trace 的 `v_s` 是沿时间反向递推的（`acc = delta_t + gamma*c_t*mask*acc`）。像 PPO 那样
+随机采样 minibatch 会打断这个迹，算出来的目标就是错的。必须对整段 rollout 计算（本例
+rollout 只有 ~128 步，整段很便宜）。
+
+## 22. 多维动作的 log-prob 要按维求和
+
+原代码 `a_dist.log_prob(act)` 返回每个动作维度的 log-prob（形状 `(B, d_act)`），而它只取
+了 `reshape(-1)[0]`，多维动作时是错的。对角高斯应取 `log_prob(act).sum(-1)` 作为联合
+log 概率。
+
+## 23. 上下文跨 episode 会串味
+
+用“把连续若干条 obs 堆起来”重建 context 时，必须在 episode 边界清零；否则新 episode 的
+context 里混着上一个 episode 的观测，价值/策略输入就错了。`build_contexts(..., dones=...)`
+在每个 batch 内先求“最近一次 done”，把边界之前的 slot 置零。
+
+## 24. 价值尺度：别让价值头从两个数量级之外开始学
+
+折扣回报量级 ≈ `reward/(1-gamma)`（`gamma=0.99` 时约为每步奖励的 100 倍）。旧代码用
+`value = dv(h)/(1-gamma)` 硬编码了这个尺度（当时 gamma=0.95）。重构时如果直接把除以
+`(1-gamma)` 删掉，价值头会比目标小 ~200 倍，MSE 巨大、学习极慢。要么保留尺度先验，要么
+上 PopArt。

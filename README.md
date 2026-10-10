@@ -30,7 +30,7 @@ dlt/                 # 工具库
 examples/            # 可运行示例（从改这里开始）
   train_demo.py      #   纯 PyTorch 训练 + 四个工具的完整用法
   lightning_demo.py  #   PyTorch Lightning Trainer 用法
-  rl_ray_ppo.py      #   Ray 多卡异步 PPO（可选，重依赖）
+  rl_ray_ppo.py      #   Ray 异步 actor-learner（IMPALA V-trace，可选，重依赖）
 tests/               # pytest
 docs/                # 详细设计/修复/性能说明
 ```
@@ -40,7 +40,12 @@ docs/                # 详细设计/修复/性能说明
 ```bash
 python examples/train_demo.py --epochs 30
 python examples/lightning_demo.py --epochs 3
+python examples/rl_ray_ppo.py --iterations 500   # 需 ray + gymnasium；IMPALA V-trace
 ```
+
+> `rl_ray_ppo.py` 是分布式 actor-learner：actor 与 learner 异步导致数据来自旧策略（异策略），
+> 因此默认用 **IMPALA 的 V-trace** 做截断重要性采样修正，而不是裸 PPO。
+> 原理、公式与调参见 [`docs/IMPALA_VTRACE.md`](docs/IMPALA_VTRACE.md)。
 
 会生成一个实验目录：
 

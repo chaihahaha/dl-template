@@ -1,35 +1,48 @@
-"""Asynchronous multi-worker PPO with Ray + PyTorch (optional heavy example).
+"""Asynchronous actor-learner with Ray + PyTorch, using IMPALA-style **V-trace**.
 
-This is the original ``rl_ray_ppo.py`` example, moved under ``examples/`` and
-bug-fixed.  It is **not** part of the minimal template and its dependencies are
-heavy::
+Why this is not plain PPO anymore
+---------------------------------
+The workers keep rolling out while the learner keeps updating the weights, so
+the data in a worker's buffer was produced by an **older** policy (the behaviour
+policy ``mu``) than the one being trained (the target policy ``pi``).  PPO's
+clipped ratio assumes the two are close (it is an *on-policy* method); with a
+stale ``mu`` the ratio/GAE targets are biased and training becomes unstable.
+
+IMPALA (Espeholt et al., 2018, "Scalable Distributed Deep-RL with Importance
+Weighted Actor-Learner Architectures", https://arxiv.org/abs/1802.01561) solves
+exactly this with **V-trace**: a truncated importance-sampling correction that
+
+* corrects the value targets for the fact that ``mu != pi``, and
+* bounds the correction, so a few very off-policy samples cannot blow the update up.
+
+The equations implemented here (paper eqs. 1-3)
+-----------------------------------------------
+::
+
+    rho_t = min(rho_bar, pi(a_t|x_t) / mu(a_t|x_t))      # value-target weight
+    c_t   = min(c_bar,   pi(a_t|x_t) / mu(a_t|x_t))      # trace truncation
+    delta_t = rho_t ( r_t + gamma V(x_{t+1}) - V(x_t) )
+    v_s   = V(x_s) + sum_{t=s}^{T-1} gamma^{t-s} (prod_{i=s}^{t-1} c_i) delta_t
+    A_s   = rho_s ( r_s + gamma v_{s+1} - V(x_s) )
+    policy loss = - E[ rho_s * A_s * log pi(a_s|x_s) ]
+    value  loss =   E[ (v_s - V(x_s))^2 ]
+
+Typical values are ``rho_bar = c_bar = 1`` (as in the paper).  ``pi`` is the
+*current* learner network; ``mu`` is the log-probability stored by the actor at
+rollout time.  When ``pi == mu`` all ratios are 1 and V-trace reduces to
+n-step/GAE-style on-policy returns, so the correction is a strict generalisation.
+
+``--policy-loss ppo`` is also provided: it uses the V-trace advantages but keeps
+the PPO clip, which is a common "V-trace + PPO" combination.  ``impala`` (the
+default) is the paper's clipped-IS policy gradient.
+
+Everything below the ``Worker`` class is pure numpy/torch and unit-tested in
+``tests/test_vtrace.py``; the Ray wiring is unchanged in spirit.
+
+Run::
 
     pip install "ray[default]" torch gymnasium
-
-Run (a real GPU is recommended)::
-
     python examples/rl_ray_ppo.py --iterations 200
-
-Fixes applied compared with the original
-----------------------------------------
-* ``ray.init()`` no longer runs at import time (importing the module had the
-  side effect of starting a cluster).
-* ``gym`` -> ``gymnasium`` (``gym`` is unmaintained and the code already used
-  the new 5-tuple ``step`` API).
-* Observability scalars ``w``/``b`` are registered as buffers, so they follow
-  the module across devices and appear in ``state_dict``.
-* The model and all tensors are moved to the correct device; ``.numpy()`` is
-  replaced by ``.detach().cpu()``.
-* Normalizer collection counters are consumed and reset (``take_collect``),
-  instead of being aggregated again and again every iteration.
-* The worker pump can be stopped; the training loop handles ``Ctrl+C`` and
-  shuts the cluster down.
-* Reward averaging and hyper-parameters come from ``argparse``.
-* **Bounded memory** (second pass): ``self.rewards`` is a ``deque(maxlen=100)``
-  instead of an ever-growing list; the replay buffer is drained on a
-  ``rollout_steps`` cadence rather than an episode-length condition (short
-  episodes used to make it grow forever); and the rollout is stacked / GAE is
-  computed once per training pass instead of once per PPO minibatch.
 """
 
 from __future__ import annotations
@@ -42,11 +55,148 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+__all__ = [
+    "vtrace_targets",
+    "build_contexts",
+    "impala_policy_loss",
+    "ppo_clipped_loss",
+    "AgentModel",
+    "ReplayMemory",
+    "Normalizer",
+    "Context",
+    "run_parallel",
+    "parse_args",
+]
 
+
+# --------------------------------------------------------------------------- #
+# V-trace (pure numpy; the core of the IMPALA fix)
+# --------------------------------------------------------------------------- #
+def vtrace_targets(
+    rewards,
+    dones,
+    values,
+    behavior_log_probs,
+    target_log_probs,
+    *,
+    gamma=0.99,
+    rho_bar=1.0,
+    c_bar=1.0,
+):
+    """Truncated importance-sampled (V-trace) value targets and advantages.
+
+    Parameters
+    ----------
+    rewards, dones:
+        length ``T`` arrays for the transitions.
+    values:
+        length ``T + 1`` array; ``values[t]`` is ``V(x_t)`` and ``values[T]`` is
+        the bootstrap value ``V(x_T)``.
+    behavior_log_probs:
+        ``log mu(a_t | x_t)`` recorded by the actor at rollout time.
+    target_log_probs:
+        ``log pi(a_t | x_t)`` under the *current* learner network.
+    gamma, rho_bar, c_bar:
+        discount and the two truncation levels (``rho_bar >= c_bar``).
+
+    Returns
+    -------
+    (vs, advantages, rhos) as float64 numpy arrays of length ``T``.
+    """
+    rewards = np.asarray(rewards, dtype=np.float64).reshape(-1)
+    dones = np.asarray(dones, dtype=np.float64).reshape(-1)
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    behavior_log_probs = np.asarray(behavior_log_probs, dtype=np.float64).reshape(-1)
+    target_log_probs = np.asarray(target_log_probs, dtype=np.float64).reshape(-1)
+
+    T = rewards.shape[0]
+    if T == 0:
+        return np.zeros(0), np.zeros(0), np.zeros(0)
+    if values.shape[0] != T + 1:
+        raise ValueError(f"values must have length T+1={T + 1}, got {values.shape[0]}")
+
+    # Importance ratios. Clipping the exponent only guards against overflow when
+    # the two policies are astronomically far apart; the truncation below is
+    # what actually bounds the correction.
+    log_ratio = np.clip(target_log_probs - behavior_log_probs, -20.0, 20.0)
+    ratio = np.exp(log_ratio)
+    rho = np.minimum(ratio, rho_bar)
+    c = np.minimum(ratio, c_bar)
+
+    mask = 1.0 - dones
+    deltas = rho * (rewards + gamma * values[1:] * mask - values[:-1])
+
+    # v_s = V_s + sum_{t>=s} gamma^{t-s} (prod c) delta_t, computed backwards.
+    vs = np.empty(T, dtype=np.float64)
+    acc = 0.0
+    for t in range(T - 1, -1, -1):
+        acc = deltas[t] + gamma * c[t] * mask[t] * acc
+        vs[t] = values[t] + acc
+
+    next_vs = np.concatenate([vs[1:], values[-1:]])
+    advantages = rho * (rewards + gamma * next_vs * mask - values[:-1])
+    return vs, advantages, rho
+
+
+def build_contexts(obs, indices, ctx_size, dones=None):
+    """Stack the ``ctx_size`` observations ending at each index.
+
+    ``obs`` is the flat sequence of per-step observations stored by the worker.
+    When ``dones`` is given, observations from *before the most recent episode
+    boundary* are zeroed, matching the zero-padded context the actor actually
+    used after an episode reset (the old stacking ignored the boundary).
+    """
+    obs = np.asarray(obs, dtype=np.float32)
+    indices = np.asarray(indices)
+    windows = np.stack(
+        [obs[indices - offset] for offset in range(ctx_size - 1, -1, -1)], axis=1
+    )
+    if dones is None:
+        return windows
+
+    dones = np.asarray(dones).astype(bool).reshape(-1)
+    last_done = np.full(obs.shape[0], -1, dtype=np.int64)
+    current = -1
+    for i in range(obs.shape[0]):
+        last_done[i] = current
+        if dones[i]:
+            current = i
+
+    windows = windows.copy()
+    for row, t in enumerate(indices):
+        boundary = last_done[t]
+        if boundary < 0:
+            continue
+        start = max(0, int(t) - ctx_size + 1)
+        for slot, position in enumerate(range(start, int(t) + 1)):
+            if position <= boundary:
+                windows[row, slot] = 0.0
+    return windows
+
+
+def impala_policy_loss(target_log_probs, advantages, rhos):
+    """``-E[ rho_s * A_s * log pi(a_s|x_s) ]`` (truncated IS policy gradient)."""
+    return -(rhos * advantages * target_log_probs).mean()
+
+
+def ppo_clipped_loss(target_log_probs, behavior_log_probs, advantages, clip=0.2):
+    """PPO clip, but with V-trace advantages (optional ``--policy-loss ppo``)."""
+    ratio = torch.exp(target_log_probs - behavior_log_probs)
+    clipped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip)
+    return -torch.min(ratio * advantages, clipped * advantages).mean()
+
+
+# --------------------------------------------------------------------------- #
+# model / rollout bookkeeping
+# --------------------------------------------------------------------------- #
 class AgentModel(nn.Module):
-    def __init__(self, ctx_size, d_obs, d_act, low, high, gamma=0.95):
+    def __init__(self, ctx_size, d_obs, d_act, low, high, gamma=0.99):
         super().__init__()
-        self.gamma = gamma
+        # Discounted returns are ~ reward / (1 - gamma), i.e. ~100x the per-step
+        # reward for gamma=0.99.  Scaling the value head by that factor gives it
+        # a sensible prior instead of starting ~200x below the targets (PopArt
+        # would learn this scale; a fixed prior is enough for this example).
+        self.value_scale = 1.0 / (1.0 - gamma)
         self.flatten = nn.Flatten()
         self.act = nn.LeakyReLU(0.01)
         self.sig = nn.Sigmoid()
@@ -62,7 +212,8 @@ class AgentModel(nn.Module):
         self.register_buffer("w", torch.as_tensor((high - low) / 2, dtype=torch.float32))
         self.register_buffer("b", torch.as_tensor((high + low) / 2, dtype=torch.float32))
 
-    def forward(self, obs):
+    def dist_value(self, obs):
+        """Return ``(action_distribution, value)`` without sampling."""
         obs = self.flatten(obs)
         h = self.act(self.d1(obs))
         h = self.ln1(h)
@@ -70,19 +221,24 @@ class AgentModel(nn.Module):
         h = self.ln2(h)
         aloc = self.w * self.tanh(self.dloc(h)) + self.b
         acov = self.sig(self.dcov(h))
-        a_dist = torch.distributions.Normal(aloc, acov)
-        act = a_dist.sample()
-        act_logprob = a_dist.log_prob(act)
-        value = self.dv(h) / (1 - self.gamma)
-        return act, act_logprob, a_dist, value
+        return torch.distributions.Normal(aloc, acov), self.dv(h) * self.value_scale
+
+    def forward(self, obs):
+        dist, value = self.dist_value(obs)
+        act = dist.sample()
+        # Sum over action dimensions -> joint log-probability (scalar per step).
+        act_logprob = dist.log_prob(act).sum(-1)
+        return act, act_logprob, dist, value
 
 
 class ReplayMemory:
+    """Flat rollout buffer: one entry per transition, in time order."""
+
     def __init__(self, dtype):
         self.dtype = dtype
         self.clear()
 
-    def add(self, obs, act, act_logprob, reward, done, value):
+    def add(self, obs, act, act_logprob, reward, done, value=None):
         self.obs.append(obs)
         self.act.append(act)
         self.act_logprob.append(act_logprob)
@@ -101,27 +257,14 @@ class ReplayMemory:
     def __len__(self):
         return len(self.r)
 
-    def arrays(self):
-        """Stack the rollout once (instead of once per PPO minibatch)."""
-        return (
-            np.asarray(self.obs, dtype=np.float32),
-            np.asarray(self.act, dtype=np.float32),
-            np.asarray(self.act_logprob, dtype=np.float32),
-        )
-
-    def sample(self, ctx_size, batch_size, obs_np, act_np, act_logprob_np, returns, advantages, device):
-        index = np.random.choice(range(ctx_size - 1, len(self.r)), batch_size)
-        obs_ctx = np.stack(
-            [obs_np[index - ctx_idx] for ctx_idx in range(ctx_size - 1, -1, -1)],
-            axis=1,
-        )
-        return (
-            torch.as_tensor(obs_ctx, dtype=self.dtype, device=device),
-            torch.as_tensor(act_np[index], dtype=self.dtype, device=device),
-            torch.as_tensor(act_logprob_np[index], dtype=self.dtype, device=device),
-            torch.as_tensor(returns[index], dtype=self.dtype, device=device),
-            torch.as_tensor(advantages[index], dtype=self.dtype, device=device),
-        )
+    def as_arrays(self):
+        return {
+            "obs": np.asarray(self.obs, dtype=np.float32),
+            "act": np.asarray(self.act, dtype=np.float32),
+            "act_logprob": np.asarray(self.act_logprob, dtype=np.float32).reshape(-1),
+            "rewards": np.asarray(self.r, dtype=np.float32).reshape(-1),
+            "dones": np.asarray(self.done, dtype=np.float32).reshape(-1),
+        }
 
 
 class Normalizer:
@@ -169,13 +312,6 @@ class Normalizer:
         self.sumsq_obs = self.sumsq_obs + obs**2
         self.cnt_obs = self.cnt_obs + 1
 
-    # numpy pickling helpers ------------------------------------------------
-    def __getstate__(self):
-        return self.__dict__.copy()
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-
 
 class Context:
     def __init__(self, ctx_size, d_obs, dtype):
@@ -201,48 +337,38 @@ class Context:
         self.normalizer = normalizer
 
 
-def compute_advantages(rewards, dones, values, gamma=0.95, lambd=0.95):
-    advantages = np.zeros(len(rewards), dtype=np.float64)
-    adv = 0.0
-    for t in range(len(rewards) - 1, -1, -1):
-        mask = 1 - int(dones[t])
-        delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
-        adv = delta + gamma * lambd * mask * adv
-        advantages[t] = adv
-    returns = advantages + np.asarray(values[:-1], dtype=np.float64)
-    return returns, advantages
-
-
-def ppo_loss(pred_act_dist, pred_value, acts, act_logprobs, returns, advantages, clip=0.2):
-    act_logprobs = act_logprobs.view(-1, 1)
-    pred_value = pred_value.view(-1, 1)
-    returns = returns.view(-1, 1)
-    advantages = advantages.view(-1, 1)
-    ratio = torch.exp(pred_act_dist.log_prob(acts) - act_logprobs)
-    clipped_ratio = torch.clip(ratio, 1 - clip, 1 + clip)
-    loss_policy = -torch.mean(torch.min(ratio * advantages, clipped_ratio * advantages))
-    loss_value = torch.mean((pred_value - returns) ** 2)
-    return loss_policy + loss_value
-
-
+# --------------------------------------------------------------------------- #
+# Ray worker
+# --------------------------------------------------------------------------- #
 def _build_worker_class(ray):
     @ray.remote(num_gpus=0.5)
     class Worker:
         def __init__(self, params):
             import gymnasium as gym
 
-            self.batch_size = params["batch_size"]
             self.ctx_size = params["ctx_size"]
             self.rollout_steps = params.get("rollout_steps", 128)
             self.dtype = params["dtype"]
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # V-trace / optimisation hyper-parameters.
+            self.gamma = params.get("gamma", 0.99)
+            self.rho_bar = params.get("rho_bar", 1.0)
+            self.c_bar = params.get("c_bar", 1.0)
+            self.epochs = params.get("epochs", 2)
+            self.value_coef = params.get("value_coef", 0.5)
+            self.entropy_coef = params.get("entropy_coef", 0.01)
+            self.max_grad_norm = params.get("max_grad_norm", 0.5)
+            self.clip = params.get("clip", 0.2)
+            self.policy_loss = params.get("policy_loss", "impala")
+            self.normalize_advantages = params.get("normalize_advantages", True)
+
             self.env = gym.make("Pendulum-v1")
             self.d_obs = self.env.observation_space.shape[0]
             self.d_act = self.env.action_space.shape[0]
             self.low = self.env.action_space.low
             self.high = self.env.action_space.high
             self.agent = AgentModel(
-                self.ctx_size, self.d_obs, self.d_act, self.low, self.high
+                self.ctx_size, self.d_obs, self.d_act, self.low, self.high, gamma=self.gamma
             ).to(self.device)
             self.opt = torch.optim.Adam(self.agent.parameters(), params["lr"])
             self.memory = ReplayMemory(self.dtype)
@@ -253,10 +379,10 @@ def _build_worker_class(ray):
             self.rewards = collections.deque(maxlen=100)
             self.done = False
             # Train every ``rollout_steps`` transitions and then drop the buffer.
-            # Keying the trigger on episode length (the old ``self.T``) meant the
-            # buffer was never cleared for short episodes -> unbounded growth.
             self.steps_since_train = 0
+            self.last_loss = 0.0
 
+        # -- introspection ------------------------------------------------- #
         def get_info_dims(self):
             return self.d_obs, self.d_act
 
@@ -266,12 +392,20 @@ def _build_worker_class(ray):
         def get_avg_reward(self):
             return float(np.mean(list(self.rewards)[-4:])) if self.rewards else 0.0
 
+        def get_last_loss(self):
+            return self.last_loss
+
         def train_get_weights_infos(self):
             if self.steps_since_train >= self.rollout_steps and len(self.memory) > self.ctx_size:
                 self.train_policy()
                 self.memory.clear()
                 self.steps_since_train = 0
-            return self.get_weights(), self.get_avg_reward(), self.context.normalizer.take_collect()
+            return (
+                self.get_weights(),
+                self.get_avg_reward(),
+                self.context.normalizer.take_collect(),
+                self.last_loss,
+            )
 
         def set_weights(self, weights):
             self.agent.load_state_dict(weights)
@@ -285,43 +419,70 @@ def _build_worker_class(ray):
             self.context.normalizer.collect_obs(obs)
             self.context.add(obs)
             self.T = 0
-            # Note: ``self.memory`` intentionally survives episode boundaries
-            # (it is cleared after each training pass), so a new episode must
-            # not reset ``steps_since_train``.
 
+        # -- learning (the IMPALA/V-trace part) ---------------------------- #
         def train_policy(self):
-            n_batches = max(1, int(self.T / self.batch_size) + 1)
-            obs_ctx = self.context.get(self.device)
-            _, _, _, last_value = self.agent(obs_ctx)
-            last_value = float(last_value.detach().cpu().reshape(-1)[0])
+            data = self.memory.as_arrays()
+            obs_flat = data["obs"]
+            size = obs_flat.shape[0]
+            if size <= self.ctx_size:
+                return
 
-            # Compute the rollout arrays and GAE once per training pass instead
-            # of once per minibatch (the old code re-stacked and re-computed
-            # them inside every ``sample`` call).
-            obs_np, act_np, act_logprob_np = self.memory.arrays()
-            returns, advantages = compute_advantages(
-                self.memory.r, self.memory.done, self.memory.value + [last_value]
+            index = np.arange(self.ctx_size - 1, size)
+            ctx_np = build_contexts(obs_flat, index, self.ctx_size, data["dones"])
+
+            ctx = torch.as_tensor(ctx_np, dtype=self.dtype, device=self.device)
+            acts = torch.as_tensor(data["act"][index], dtype=self.dtype, device=self.device)
+            behavior_logp = torch.as_tensor(
+                data["act_logprob"][index], dtype=self.dtype, device=self.device
             )
+            rewards = data["rewards"][index]
+            dones = data["dones"][index]
 
-            self.opt.zero_grad()
-            for _ in range(n_batches):
-                batch = self.memory.sample(
-                    self.ctx_size,
-                    self.batch_size,
-                    obs_np,
-                    act_np,
-                    act_logprob_np,
-                    returns,
-                    advantages,
-                    self.device,
-                )
-                obs_ctxs, acts, act_logprobs, batch_returns, batch_advantages = batch
-                _, _, pred_act_dist, pred_value = self.agent(obs_ctxs)
-                loss = ppo_loss(
-                    pred_act_dist, pred_value, acts, act_logprobs, batch_returns, batch_advantages
-                )
-                (loss / n_batches).backward()
-            self.opt.step()
+            last_loss = torch.tensor(0.0, device=self.device)
+            for _ in range(self.epochs):
+                dist, values = self.agent.dist_value(ctx)
+                target_logp = dist.log_prob(acts).sum(-1)
+                _, bootstrap = self.agent.dist_value(self.context.get(self.device))
+                values_np = torch.cat([values.reshape(-1), bootstrap.reshape(-1)]).detach().cpu().numpy()
+
+                # Targets are constants: no gradient flows through V-trace.
+                with torch.no_grad():
+                    vs, advantages, rhos = vtrace_targets(
+                        rewards,
+                        dones,
+                        values_np,
+                        behavior_logp.detach().cpu().numpy(),
+                        target_logp.detach().cpu().numpy(),
+                        gamma=self.gamma,
+                        rho_bar=self.rho_bar,
+                        c_bar=self.c_bar,
+                    )
+                    vs_t = torch.as_tensor(vs, dtype=self.dtype, device=self.device)
+                    adv_t = torch.as_tensor(advantages, dtype=self.dtype, device=self.device)
+                    rho_t = torch.as_tensor(rhos, dtype=self.dtype, device=self.device)
+                if self.normalize_advantages and adv_t.numel() > 1:
+                    # A per-batch affine transform of the advantages does not
+                    # change the V-trace correction, it just scales the gradient.
+                    adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
+                if self.policy_loss == "ppo":
+                    policy_loss = ppo_clipped_loss(
+                        target_logp, behavior_logp, adv_t, clip=self.clip
+                    )
+                else:
+                    policy_loss = impala_policy_loss(target_logp, adv_t, rho_t)
+
+                value_loss = torch.mean((values.reshape(-1) - vs_t) ** 2)
+                entropy = dist.entropy().sum(-1).mean()
+                last_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.opt.zero_grad(set_to_none=True)
+                last_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
+                self.opt.step()
+
+            self.last_loss = float(last_loss.detach().cpu())
 
         def rollout(self, T_rollout):
             for _ in range(T_rollout):
@@ -376,6 +537,9 @@ def _build_caller_class(ray):
     return WorkerCaller
 
 
+# --------------------------------------------------------------------------- #
+# driver
+# --------------------------------------------------------------------------- #
 def run_parallel(args):
     import ray
 
@@ -389,11 +553,20 @@ def run_parallel(args):
     WorkerCaller = _build_caller_class(ray)
 
     params = {
-        "batch_size": args.batch_size,
         "ctx_size": args.ctx_size,
         "rollout_steps": args.rollout_steps,
         "lr": args.lr,
         "dtype": torch.float32,
+        "gamma": args.gamma,
+        "rho_bar": args.rho_bar,
+        "c_bar": args.c_bar,
+        "epochs": args.epochs,
+        "value_coef": args.value_coef,
+        "entropy_coef": args.entropy_coef,
+        "max_grad_norm": args.max_grad_norm,
+        "clip": args.clip,
+        "policy_loss": args.policy_loss,
+        "normalize_advantages": args.normalize_advantages,
     }
     workers = [Worker.remote(params) for _ in range(args.n_workers)]
     avg_weight = ray.get(workers[0].get_weights.remote())
@@ -407,7 +580,7 @@ def run_parallel(args):
     try:
         for iteration in range(args.iterations):
             infos = ray.get([w.train_get_weights_infos.remote() for w in workers])
-            workers_weights, workers_reward, workers_stats = zip(*infos)
+            workers_weights, workers_reward, workers_stats, workers_loss = zip(*infos)
             avg_weight = {
                 k: sum(w[k] for w in workers_weights) / args.n_workers for k in avg_weight
             }
@@ -420,7 +593,10 @@ def run_parallel(args):
                 handles.append(worker.set_normalizer.remote(normalizer))
             ray.get(handles)
 
-            print(f"[{iteration}] avg_reward={sum(workers_reward) / args.n_workers:.3f}")
+            print(
+                f"[{iteration}] avg_reward={sum(workers_reward) / args.n_workers:.3f} "
+                f"loss={sum(workers_loss) / args.n_workers:.3f}"
+            )
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("manually stopped")
@@ -433,13 +609,32 @@ def run_parallel(args):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Async multi-worker PPO with Ray")
+    parser = argparse.ArgumentParser(
+        description="Async actor-learner (IMPALA V-trace) with Ray"
+    )
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--n-workers", type=int, default=2)
     parser.add_argument("--rollout-steps", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--ctx-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--rho-bar", type=float, default=1.0, help="V-trace rho truncation")
+    parser.add_argument("--c-bar", type=float, default=1.0, help="V-trace c truncation")
+    parser.add_argument("--epochs", type=int, default=2, help="optimisation passes per batch")
+    parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--clip", type=float, default=0.2)
+    parser.add_argument(
+        "--policy-loss", choices=("impala", "ppo"), default="impala",
+        help="impala = V-trace IS policy gradient; ppo = V-trace advantages + PPO clip",
+    )
+    parser.add_argument(
+        "--normalize-advantages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="standardise V-trace advantages per batch before the policy loss",
+    )
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--local-mode", action="store_true")
     return parser.parse_args(argv)

@@ -1,8 +1,8 @@
-"""Regression tests for the example PPO implementation.
+"""Regression tests for the example actor-learner's non-V-trace pieces.
 
-These exercise the pure-PyTorch/NumPy pieces (no Ray, no Gymnasium required) and
-guard the memory fixes: bounded reward history, replay-buffer draining, single
-stacking per training pass, and the normalizer counter reset.
+The V-trace math lives in ``tests/test_vtrace.py``; here we cover the buffer,
+normalizer, model shapes and the bounded-memory cadence.  No Ray or Gymnasium
+required.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ torch = pytest.importorskip("torch")
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_ppo():
+def load_module():
     spec = importlib.util.spec_from_file_location(
         "rl_ray_ppo_example", ROOT / "examples" / "rl_ray_ppo.py"
     )
@@ -29,50 +29,28 @@ def load_ppo():
     return module
 
 
-ppo = load_ppo()
+ppo = load_module()
 
 
-def make_memory(length: int = 40, d_obs: int = 4, d_act: int = 2):
+def test_replay_memory_arrays_shape_and_order() -> None:
     memory = ppo.ReplayMemory(torch.float32)
-    for t in range(length):
+    for t in range(5):
         memory.add(
-            np.random.randn(d_obs).astype(np.float32),
-            np.random.randn(d_act).astype(np.float32),
-            0.3,
-            1.0,
-            t % 13 == 0,
-            0.5,
+            obs=np.full(4, t, dtype=np.float32),
+            act=np.array([t, -t], dtype=np.float32),
+            act_logprob=float(-t),
+            reward=float(t),
+            done=(t == 2),
+            value=0.5,
         )
-    return memory
-
-
-def test_replay_sample_shapes_and_single_stacking() -> None:
-    memory = make_memory()
-    obs, act, logp = memory.arrays()
-    returns, advantages = ppo.compute_advantages(memory.r, memory.done, memory.value + [0.1])
-    batch = memory.sample(8, 16, obs, act, logp, returns, advantages, torch.device("cpu"))
-    obs_ctx, acts, act_logprobs, batch_returns, batch_advantages = batch
-    assert obs_ctx.shape == (16, 8, 4)
-    assert acts.shape == (16, 2)
-    assert act_logprobs.shape == (16,)
-    assert batch_returns.shape == (16,) and batch_advantages.shape == (16,)
-    assert len(memory) == 40
-
-
-def test_sample_no_longer_recomputes_gae_per_batch() -> None:
-    signature = inspect.signature(ppo.ReplayMemory.sample)
-    assert "last_value" not in signature.parameters
-    assert {"returns", "advantages"} <= set(signature.parameters)
-
-
-def test_compute_advantages_masks_done() -> None:
-    rewards = [1.0, 1.0, 1.0]
-    dones = [False, True, False]
-    values = [0.5, 0.5, 0.5, 0.5]
-    returns, advantages = ppo.compute_advantages(rewards, dones, values)
-    assert returns.shape == advantages.shape == (3,)
-    # The transition *into* the done state must not bootstrap through it.
-    assert advantages[1] == pytest.approx(rewards[1] - values[1])
+    arrays = memory.as_arrays()
+    assert len(memory) == 5
+    assert arrays["obs"].shape == (5, 4)
+    assert arrays["act"].shape == (5, 2)
+    assert arrays["act_logprob"].shape == (5,)
+    assert arrays["rewards"].shape == (5,)
+    assert arrays["dones"].tolist() == [0, 0, 1, 0, 0]
+    assert np.allclose(arrays["obs"][3], 3.0)
 
 
 def test_normalizer_take_collect_resets_counters() -> None:
@@ -85,7 +63,6 @@ def test_normalizer_take_collect_resets_counters() -> None:
     assert second["cnt"] == 0.0
     assert np.allclose(second["sum"], 0.0)
 
-    # Aggregate once: no double counting even if take_collect is called twice.
     merged = ppo.Normalizer((4,), np.float32)
     merged.aggregate(first)
     merged.aggregate(second)
@@ -94,15 +71,22 @@ def test_normalizer_take_collect_resets_counters() -> None:
     assert np.all(std >= 0)
 
 
-def test_agent_observability_values_are_registered_buffers() -> None:
+def test_agent_shapes_and_registered_buffers() -> None:
     model = ppo.AgentModel(2, 4, 2, np.array([-1.0, -1.0]), np.array([1.0, 1.0]))
     state = model.state_dict()
     assert "w" in state and "b" in state
+
     obs = torch.zeros(1, 2, 4)
-    act, logprob, dist, value = model(obs)
-    assert act.shape == (1, 2)
-    assert logprob.shape == (1, 2)
+    dist, value = model.dist_value(obs)
     assert value.shape == (1, 1)
+    assert dist.mean.shape == (1, 2)
+
+    act, logprob, dist2, value2 = model(obs)
+    assert act.shape == (1, 2)
+    # joint log-probability: summed over action dimensions
+    assert logprob.shape == (1,)
+    assert value2.shape == (1, 1)
+    assert dist2.mean.shape == (1, 2)
 
 
 def test_rollout_step_count_drives_training_cadence() -> None:

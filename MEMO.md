@@ -11,7 +11,7 @@
 - [x] 旧根文件改为兼容 shim（`never_overwrite` / `plot_utils` / `yaml_logging`）
 - [x] `rl_ray_ppo.py` → `examples/rl_ray_ppo.py`（现代 gymnasium + 修 bug）
 - [x] `examples/train_demo.py` 端到端示例（已验证可运行）
-- [x] `tests/` 71 个用例全绿（含 async 日志、PPO 内存回归、plot 极端情况、Lightning 集成）
+- [x] `tests/` 93 个用例全绿（含 async 日志、PPO 内存、V-trace、plot 极端情况、Lightning）
 - [x] `pyproject.toml`、`README.md`、`docs/FIXES.md`、`docs/DESIGN.md`
 - [x] `.gitignore` 补齐 AGENTS.md 要求的目录
 
@@ -32,6 +32,14 @@
       `@protect_paths("path")`（只备份参数，完全不改 `open`）
 - [x] 全局 patch 改为显式 `install()` 或 `DLT_NEVER_OVERWRITE=1`
 - [x] 示例 `train_demo.py` 改用 `@protect_paths("path")`
+
+## 第五轮（IMPALA V-trace）
+
+- [x] `examples/rl_ray_ppo.py` 的损失从 GAE+PPO 换成 **V-trace 截断重要性采样**
+      （`vtrace_targets` + `impala_policy_loss`），修异步异策略不稳定
+- [x] 修 log-prob（动作维求和）、episode 边界上下文清零、价值尺度先验、优势标准化
+- [x] 新增 `tests/test_vtrace.py`（与论文公式 O(T²) 实现逐步对齐），全套 93 用例
+- [x] 文档 `docs/IMPALA_VTRACE.md`（问题/公式/代码对应/调参/参考）
 
 ## 第二轮（性能与资源）
 

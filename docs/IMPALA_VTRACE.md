@@ -1,0 +1,106 @@
+# 异步 actor-learner 的异策略问题与 V-trace 修复
+
+对应文件：`examples/rl_ray_ppo.py`（默认 `--policy-loss impala`）。
+
+## 1. 问题：为什么异步 PPO 会不稳定
+
+当前架构是 actor-learner：
+
+* actor（`Worker.rollout`）持续用**当前权重** `mu` 采样并写入 buffer；
+* learner（`Worker.train_policy`）稍后才用**已经变过的权重** `pi` 去训练这份数据。
+
+也就是说，buffer 里的 `(s, a, r)` 由旧策略 `mu` 产生，而更新用的是新策略 `pi`。PPO 的
+clip 比例 `pi(a|s)/mu(a|s)` 和 GAE 目标都假设 `mu ≈ pi`（on-policy）；当 rollout 与训练
+之间存在权重滞后时，这个假设被打破：
+
+* 价值目标 `r + γV(s')` 用的是**当前** `V`，但轨迹来自旧策略 → 目标有偏；
+* 少数很偏离的样本会产生巨大的比例，梯度被放大 → 训练震荡/发散。
+
+## 2. IMPALA 的解法：V-trace
+
+IMPALA（Espeholt et al., ICML 2018）用**截断重要性采样**修正价值目标，并用它做策略梯度。
+实现见 `vtrace_targets()`：
+
+```
+rho_t = min(rho_bar, pi(a_t|x_t) / mu(a_t|x_t))     # 价值目标的权重
+c_t   = min(c_bar,   pi(a_t|x_t) / mu(a_t|x_t))     # 迹的截断系数
+delta_t = rho_t ( r_t + gamma V(x_{t+1}) - V(x_t) )
+v_s  = V(x_s) + sum_{t=s}^{T-1} gamma^{t-s} (prod_{i=s}^{t-1} c_i) delta_t
+A_s  = rho_s ( r_s + gamma v_{s+1} - V(x_s) )
+policy loss = - E[ rho_s * A_s * log pi(a_s|x_s) ]
+value  loss =   E[ (v_s - V(x_s))^2 ]
+```
+
+要点：
+
+* `v_s` 是修正后的价值目标（`vs`）；`A_s` 是修正后的优势；
+* `rho_bar` / `c_bar` **截断**重要性权重，单个很离策略的样本无法把更新炸掉；论文默认
+  两者都为 1；
+* 当 `pi == mu` 时所有比例为 1，V-trace 退化为 on-policy 的多步回报，因此它是 on-policy
+  方法的严格推广。
+
+代码对应：
+
+| 论文符号 | 代码 |
+| --- | --- |
+| `mu` | 采样时存下的 `act_logprob`（`ReplayMemory.act_logprob`） |
+| `pi` | 训练时用当前网络重算的 `dist.log_prob(acts).sum(-1)` |
+| `V` | `AgentModel.dist_value()` 的 value 输出 |
+| `v_s, A_s, rho` | `vtrace_targets(...)` 返回值 |
+| 策略损失 | `impala_policy_loss(...)`；`--policy-loss ppo` 时用 `ppo_clipped_loss(...)` |
+
+## 3. 相对原实现的改动
+
+1. **损失换成 V-trace**：删掉 GAE + `ppo_loss`，改为 `vtrace_targets` +
+   `impala_policy_loss`（默认）；保留 `--policy-loss ppo` 作为“V-trace 优势 + PPO clip”
+   的选项。
+2. **按轨迹整段训练**：V-trace 的迹是沿时间递推的，按 minibatch 随机采样会打断它，
+   所以每个 batch 对整段 rollout、做 `--epochs` 遍（默认 2）。
+3. **正确存储 log-prob**：原来 `a_dist.log_prob(act)` 只取了第一个维度，多维动作会错；
+   现在对动作维求和（`sum(-1)`），得到联合 log 概率。
+4. **上下文重建修复**：`build_contexts(..., dones=...)` 会在 episode 边界把旧 episode 的
+   观测清零，和 actor 重置后的零填充上下文一致（原来跨 episode 直接堆叠）。
+5. **价值尺度先验**：`AgentModel.value_scale = 1/(1-gamma)`。折扣回报量级约为
+   `reward/(1-gamma)`（`gamma=0.99` 时是每步奖励的 ~100 倍），不缩放会让价值头一开始就
+   比目标小两个数量级（旧代码用同样的除法，只是硬编码了 0.95）。
+6. **优势标准化**：`--normalize-advantages`（默认开）对每个 batch 做仿射标准化，纯粹是
+   梯度尺度控制，不改变 V-trace 修正本身。
+7. 参数全部走 `argparse`：`--gamma --rho-bar --c-bar --epochs --value-coef
+   --entropy-coef --max-grad-norm --policy-loss`。
+
+## 4. 怎么用 / 怎么调
+
+```bash
+pip install "ray[default]" torch gymnasium
+python examples/rl_ray_ppo.py --iterations 500            # 默认 impala
+python examples/rl_ray_ppo.py --policy-loss ppo           # V-trace + PPO clip
+```
+
+* **滞后越严重**（worker 越多、rollout 越长、训练越慢）越应该用 V-trace；
+* `rho_bar`/`c_bar` 调小（如 0.5）会更保守、方差更低，但偏差更大；默认 1.0；
+* `--epochs` 越大越 off-policy（同一批数据被反复用），V-trace 仍能纠正，但建议 ≤ 3；
+* 如果任务是 dense reward 且量级很大，先用 `--gamma` 和奖励缩放把回报控制住。
+
+## 5. 验证
+
+纯函数部分有完整单测（`tests/test_vtrace.py`）：
+
+* 与论文公式的 **O(T²) 直接实现逐步对齐**（随机数据 + 多种 `rho_bar/c_bar`）；
+* on-policy 时退化为折扣回报；
+* 比例截断到 `rho_bar`；
+* `done` 会同时中断 bootstrap 和迹的乘积；
+* 空输入、长度校验、策略损失梯度/裁剪行为。
+
+另外用 no-op Ray stub 驱动真实 `Worker`（Gymnasium Pendulum）跑训练，确认损失有限、
+缓冲区有界（`tests/test_ppo_worker.py`）。
+
+> 说明：这里验证的是**修正的正确性与数值稳定性**，不是“多少步解出 Pendulum”。
+> Pendulum 本身需要远多于示例默认步数才能收敛；示例的定位是可读、可扩展的分布式骨架。
+
+## 参考
+
+* IMPALA 论文：Espeholt et al., *IMPALA: Scalable Distributed Deep-RL with Importance
+  Weighted Actor-Learner Architectures*, ICML 2018,
+  <https://arxiv.org/abs/1802.01561>（V-trace 见第 2 节）。
+* 你给出的参考实现：
+  <https://github.com/RLOpensource/IMPALA-Scalable-Distributed-Deep-RL-with-Importance-Weighted-Actor-Learner-Architectures>
