@@ -60,13 +60,31 @@ value  loss =   E[ (v_s - V(x_s))^2 ]
    现在对动作维求和（`sum(-1)`），得到联合 log 概率。
 4. **上下文重建修复**：`build_contexts(..., dones=...)` 会在 episode 边界把旧 episode 的
    观测清零，和 actor 重置后的零填充上下文一致（原来跨 episode 直接堆叠）。
-5. **价值尺度先验**：`AgentModel.value_scale = 1/(1-gamma)`。折扣回报量级约为
-   `reward/(1-gamma)`（`gamma=0.99` 时是每步奖励的 ~100 倍），不缩放会让价值头一开始就
-   比目标小两个数量级（旧代码用同样的除法，只是硬编码了 0.95）。
+5. **PopArt 价值归一化**：`PopArtValue` 维护价值目标的滑动均值/方差，价值头预测
+   *归一化* 价值 `v_norm`，实际价值为 `v_norm * std + mean`；每次更新统计量时同步缩放
+   linear 层的权重/偏置，保证输出不变；损失在归一化空间计算。折扣回报量级约为
+   `reward/(1-gamma)`（`gamma=0.99` 时是每步奖励的 ~100 倍），不做归一化会让价值损失高达
+   `1e4~1e5` 且价值头学不动；PopArt 后归一化损失回到 O(1)，这也是 IMPALA 论文的做法。
+   `--popart-beta`（默认 0.99）控制统计量的 EMA；首次更新直接用整批统计量。
 6. **优势标准化**：`--normalize-advantages`（默认开）对每个 batch 做仿射标准化，纯粹是
    梯度尺度控制，不改变 V-trace 修正本身。
 7. 参数全部走 `argparse`：`--gamma --rho-bar --c-bar --epochs --value-coef
-   --entropy-coef --max-grad-norm --policy-loss`。
+   --entropy-coef --max-grad-norm --policy-loss --popart-beta
+   --normalize-advantages`。
+
+### PopArt 更新公式
+
+```
+batch_mean, batch_var = mean(targets), var(targets)
+new_mean = beta*mean + (1-beta)*batch_mean
+new_var  = beta*var  + (1-beta)*batch_var
+scale    = sqrt(var+eps) / sqrt(new_var+eps)
+W <- W * scale                     # 保持输出不变
+b <- b * scale + (mean - new_mean) / sqrt(new_var+eps)
+mean, var <- new_mean, new_var
+```
+
+保持输出不变很关键：策略分布不会因为价值尺度变化而被“惊到”，只是损失被重新缩放。
 
 ## 4. 怎么用 / 怎么调
 
@@ -89,13 +107,28 @@ python examples/rl_ray_ppo.py --policy-loss ppo           # V-trace + PPO clip
 * on-policy 时退化为折扣回报；
 * 比例截断到 `rho_bar`；
 * `done` 会同时中断 bootstrap 和迹的乘积；
-* 空输入、长度校验、策略损失梯度/裁剪行为。
+* 空输入、长度校验、策略损失梯度/裁剪行为；
+* **PopArt**：首次更新等于整批统计量、更新统计量时输出保持不变、归一化后目标
+  `mean≈0, std≈1`、EMA 随重复更新收敛。
 
 另外用 no-op Ray stub 驱动真实 `Worker`（Gymnasium Pendulum）跑训练，确认损失有限、
 缓冲区有界（`tests/test_ppo_worker.py`）。
 
-> 说明：这里验证的是**修正的正确性与数值稳定性**，不是“多少步解出 Pendulum”。
-> Pendulum 本身需要远多于示例默认步数才能收敛；示例的定位是可读、可扩展的分布式骨架。
+### 真实 Ray 多进程 + GPU 实跑
+
+```
+python examples/rl_ray_ppo.py --iterations 1200 --n-workers 4 --num-gpus 1 \
+    --worker-gpus 0.25 --rollout-steps 128 --lr 5e-4
+```
+
+GTX 1070 / Ray 2.59 上连续 1200 次迭代**无 NaN、无异常**，per-step reward 从 -6.11 提升到
+-4.47（趋势约 +0.17/100 迭代），loss 稳定在 ~0.3。期间修掉了真实多进程才会暴露的问题：
+`WorkerCaller` 退出死锁、`Normalizer` 全局统计与 worker 增量混用导致的指数爆炸、PopArt
+eps 不一致等（见 `PITFALL.md` 第 25–30 条）。复现绘图的脚本：
+`scripts/plot_rl_log.py`。
+
+> 说明：这里验证的是**修正的正确性与训练稳定性**（以及指标确实上升），不是“多少步解出
+> Pendulum”。Pendulum 完全收敛需要远多于示例默认步数；示例的定位是可读、可扩展的分布式骨架。
 
 ## 参考
 

@@ -25,12 +25,18 @@ The equations implemented here (paper eqs. 1-3)
     v_s   = V(x_s) + sum_{t=s}^{T-1} gamma^{t-s} (prod_{i=s}^{t-1} c_i) delta_t
     A_s   = rho_s ( r_s + gamma v_{s+1} - V(x_s) )
     policy loss = - E[ rho_s * A_s * log pi(a_s|x_s) ]
-    value  loss =   E[ (v_s - V(x_s))^2 ]
+    value  loss =   E[ (v_s - V(x_s))^2 ]   # computed in PopArt-normalised space
 
 Typical values are ``rho_bar = c_bar = 1`` (as in the paper).  ``pi`` is the
 *current* learner network; ``mu`` is the log-probability stored by the actor at
 rollout time.  When ``pi == mu`` all ratios are 1 and V-trace reduces to
 n-step/GAE-style on-policy returns, so the correction is a strict generalisation.
+
+The value head uses **PopArt** (``PopArtValue``) as in the IMPALA paper: it keeps
+a running mean/variance of the value targets and rescales its linear layer so the
+predicted value is preserved while the loss is computed in normalised space.
+This keeps the value scale under control when discounted returns are ~100x the
+per-step reward.
 
 ``--policy-loss ppo`` is also provided: it uses the V-trace advantages but keeps
 the PPO clip, which is a common "V-trace + PPO" combination.  ``impala`` (the
@@ -49,17 +55,22 @@ from __future__ import annotations
 
 import argparse
 import collections
+import logging
+import threading
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+_LOG = logging.getLogger("dlt.rl_ray_ppo")
+
 __all__ = [
     "vtrace_targets",
     "build_contexts",
     "impala_policy_loss",
     "ppo_clipped_loss",
+    "PopArtValue",
     "AgentModel",
     "ReplayMemory",
     "Normalizer",
@@ -189,14 +200,69 @@ def ppo_clipped_loss(target_log_probs, behavior_log_probs, advantages, clip=0.2)
 # --------------------------------------------------------------------------- #
 # model / rollout bookkeeping
 # --------------------------------------------------------------------------- #
-class AgentModel(nn.Module):
-    def __init__(self, ctx_size, d_obs, d_act, low, high, gamma=0.99):
+class PopArtValue(nn.Module):
+    """PopArt: adaptively normalise value targets while preserving predictions.
+
+    The head predicts a *normalised* value ``v_norm``; the real value is
+    ``v_norm * std + mean``.  We keep a running mean/variance of the (V-trace)
+    value targets and, whenever the statistics change, rescale the linear
+    weights so the predicted value is unchanged.  The loss is then computed in
+    normalised space, which is what keeps the value scale under control when the
+    discounted returns are ~100x the per-step reward (IMPALA uses PopArt for the
+    same reason).
+    """
+
+    def __init__(self, d_in, beta=0.99):
         super().__init__()
-        # Discounted returns are ~ reward / (1 - gamma), i.e. ~100x the per-step
-        # reward for gamma=0.99.  Scaling the value head by that factor gives it
-        # a sensible prior instead of starting ~200x below the targets (PopArt
-        # would learn this scale; a fixed prior is enough for this example).
-        self.value_scale = 1.0 / (1.0 - gamma)
+        self.linear = nn.Linear(d_in, 1)
+        self.beta = beta
+        self.register_buffer("mean", torch.zeros(1))
+        self.register_buffer("var", torch.ones(1))
+        self.register_buffer("initialized", torch.zeros(1, dtype=torch.bool))
+
+    @property
+    def std(self):
+        # Floor the scale: if the targets briefly have (near) zero variance the
+        # normalised targets would explode.  Kept well above the epsilon used
+        # when learning the variance.
+        return torch.sqrt(self.var + 1e-4).clamp(min=1e-3)
+
+    def forward(self, h):
+        return self.linear(h)  # normalised value
+
+    def denormalize(self, v_norm):
+        return v_norm * self.std + self.mean
+
+    def normalize(self, values):
+        return (values - self.mean) / self.std
+
+    @torch.no_grad()
+    def update(self, targets):
+        """Adapt mean/var to ``targets`` and rescale weights to preserve outputs."""
+        targets = targets.reshape(-1).float()
+        if targets.numel() == 0:
+            return
+        batch_mean = targets.mean()
+        batch_var = targets.var(unbiased=False)
+        old_mean, old_std = self.mean.clone(), self.std.clone()
+        if not bool(self.initialized):
+            new_mean, new_var = batch_mean, batch_var
+            self.initialized.fill_(True)
+        else:
+            new_mean = self.beta * old_mean + (1 - self.beta) * batch_mean
+            new_var = self.beta * self.var + (1 - self.beta) * batch_var
+        new_std = torch.sqrt(new_var + 1e-4).clamp(min=1e-3)
+        # Preserve outputs: v * old_std + old_mean == v' * new_std + new_mean.
+        scale = (old_std / new_std).reshape(1)
+        self.linear.weight.data.mul_(scale)
+        self.linear.bias.data.mul_(scale).add_(((old_mean - new_mean) / new_std).reshape(1))
+        self.mean.copy_(new_mean.reshape(1))
+        self.var.copy_(new_var.reshape(1))
+
+
+class AgentModel(nn.Module):
+    def __init__(self, ctx_size, d_obs, d_act, low, high, popart_beta=0.99):
+        super().__init__()
         self.flatten = nn.Flatten()
         self.act = nn.LeakyReLU(0.01)
         self.sig = nn.Sigmoid()
@@ -205,23 +271,34 @@ class AgentModel(nn.Module):
         self.ln1 = nn.LayerNorm(128)
         self.ln2 = nn.LayerNorm(128)
         self.d2 = nn.Linear(128, 128)
-        self.dv = nn.Linear(128, 1)
+        self.dv = PopArtValue(128, beta=popart_beta)
         self.dloc = nn.Linear(128, d_act)
         self.dcov = nn.Linear(128, d_act)
         # Buffers so they move with .to(device) and show up in state_dict.
         self.register_buffer("w", torch.as_tensor((high - low) / 2, dtype=torch.float32))
         self.register_buffer("b", torch.as_tensor((high + low) / 2, dtype=torch.float32))
 
-    def dist_value(self, obs):
-        """Return ``(action_distribution, value)`` without sampling."""
+    def features(self, obs):
         obs = self.flatten(obs)
         h = self.act(self.d1(obs))
         h = self.ln1(h)
         h = self.act(self.d2(h))
         h = self.ln2(h)
+        return h
+
+    def dist_value_norm(self, obs):
+        """Return ``(distribution, normalised value)`` for training (PopArt space)."""
+        h = self.features(obs)
         aloc = self.w * self.tanh(self.dloc(h)) + self.b
-        acov = self.sig(self.dcov(h))
-        return torch.distributions.Normal(aloc, acov), self.dv(h) * self.value_scale
+        # Floor the scale: sigmoid can saturate to 0, which would make the
+        # Gaussian entropy -inf and poison the loss.
+        acov = self.sig(self.dcov(h)) + 1e-3
+        return torch.distributions.Normal(aloc, acov), self.dv(h)
+
+    def dist_value(self, obs):
+        """Return ``(distribution, value)`` in real units, without sampling."""
+        dist, v_norm = self.dist_value_norm(obs)
+        return dist, self.dv.denormalize(v_norm)
 
     def forward(self, obs):
         dist, value = self.dist_value(obs)
@@ -268,7 +345,20 @@ class ReplayMemory:
 
 
 class Normalizer:
-    """Running mean/std with separate "collection" counters for async workers."""
+    """Running observation mean/std with per-worker delta accumulation.
+
+    Two *separate* sets of counters are essential:
+
+    * ``sum_obs / sumsq_obs / cnt_obs`` are the **global** statistics used for
+      normalisation (shared with workers via :meth:`adopt`);
+    * ``sum_obs_collect / sumsq_obs_collect / cnt_obs_collect`` accumulate only
+      the observations this worker has seen since the last :meth:`take_collect`.
+
+    If a single set were used for both, the driver would re-send the global
+    totals to every worker, ``take_collect`` would hand them back, and
+    ``aggregate`` would add them again -- the statistics would grow like
+    ``(1 + n_workers)^iterations`` until they overflow to NaN.
+    """
 
     def __init__(self, obs_shape, dtype):
         self.dtype = dtype
@@ -276,23 +366,35 @@ class Normalizer:
         self.sum_obs = np.zeros(obs_shape, dtype=dtype)
         self.sumsq_obs = np.zeros(obs_shape, dtype=dtype)
         self.cnt_obs = 0.0
+        self.reset_collect()
+
+    def reset_collect(self):
+        self.sum_obs_collect = np.zeros(self.obs_shape, dtype=self.dtype)
+        self.sumsq_obs_collect = np.zeros(self.obs_shape, dtype=self.dtype)
+        self.cnt_obs_collect = 0.0
 
     def take_collect(self):
-        """Return this worker's freshly collected sums and reset them."""
+        """Return this worker's freshly collected deltas and reset them."""
         stats = {
-            "sum": self.sum_obs.copy(),
-            "sumsq": self.sumsq_obs.copy(),
-            "cnt": self.cnt_obs,
+            "sum": self.sum_obs_collect.copy(),
+            "sumsq": self.sumsq_obs_collect.copy(),
+            "cnt": self.cnt_obs_collect,
         }
-        self.sum_obs = np.zeros(self.obs_shape, dtype=self.dtype)
-        self.sumsq_obs = np.zeros(self.obs_shape, dtype=self.dtype)
-        self.cnt_obs = 0.0
+        self.reset_collect()
         return stats
 
     def aggregate(self, stats):
-        self.sum_obs += stats["sum"]
-        self.sumsq_obs += stats["sumsq"]
-        self.cnt_obs += stats["cnt"]
+        """Fold another normalizer's *deltas* into these global statistics."""
+        self.sum_obs = self.sum_obs + stats["sum"]
+        self.sumsq_obs = self.sumsq_obs + stats["sumsq"]
+        self.cnt_obs = self.cnt_obs + stats["cnt"]
+
+    def adopt(self, other):
+        """Use ``other``'s running statistics for normalisation (reset deltas)."""
+        self.sum_obs = np.array(other.sum_obs, dtype=self.dtype, copy=True)
+        self.sumsq_obs = np.array(other.sumsq_obs, dtype=self.dtype, copy=True)
+        self.cnt_obs = float(other.cnt_obs)
+        self.reset_collect()
 
     def mean_std_obs(self):
         if self.cnt_obs <= 0:
@@ -308,9 +410,10 @@ class Normalizer:
         return (obs - mean_obs) / (1e-3 + std_obs)
 
     def collect_obs(self, obs):
-        self.sum_obs = self.sum_obs + obs
-        self.sumsq_obs = self.sumsq_obs + obs**2
-        self.cnt_obs = self.cnt_obs + 1
+        """Accumulate one observation into this worker's delta counters."""
+        self.sum_obs_collect = self.sum_obs_collect + obs
+        self.sumsq_obs_collect = self.sumsq_obs_collect + obs**2
+        self.cnt_obs_collect = self.cnt_obs_collect + 1
 
 
 class Context:
@@ -334,14 +437,15 @@ class Context:
         self.obs_ctx = [np.zeros(self.d_obs, dtype=np.float32) for _ in range(self.ctx_size)]
 
     def set_normalizer(self, normalizer):
-        self.normalizer = normalizer
+        # Adopt the global statistics but keep collecting our own deltas.
+        self.normalizer.adopt(normalizer)
 
 
 # --------------------------------------------------------------------------- #
 # Ray worker
 # --------------------------------------------------------------------------- #
-def _build_worker_class(ray):
-    @ray.remote(num_gpus=0.5)
+def _build_worker_class(ray, num_gpus=0.5):
+    @ray.remote(num_gpus=num_gpus)
     class Worker:
         def __init__(self, params):
             import gymnasium as gym
@@ -349,6 +453,7 @@ def _build_worker_class(ray):
             self.ctx_size = params["ctx_size"]
             self.rollout_steps = params.get("rollout_steps", 128)
             self.dtype = params["dtype"]
+            self.lr = params["lr"]
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             # V-trace / optimisation hyper-parameters.
             self.gamma = params.get("gamma", 0.99)
@@ -361,6 +466,7 @@ def _build_worker_class(ray):
             self.clip = params.get("clip", 0.2)
             self.policy_loss = params.get("policy_loss", "impala")
             self.normalize_advantages = params.get("normalize_advantages", True)
+            self.popart_beta = params.get("popart_beta", 0.99)
 
             self.env = gym.make("Pendulum-v1")
             self.d_obs = self.env.observation_space.shape[0]
@@ -368,7 +474,12 @@ def _build_worker_class(ray):
             self.low = self.env.action_space.low
             self.high = self.env.action_space.high
             self.agent = AgentModel(
-                self.ctx_size, self.d_obs, self.d_act, self.low, self.high, gamma=self.gamma
+                self.ctx_size,
+                self.d_obs,
+                self.d_act,
+                self.low,
+                self.high,
+                popart_beta=self.popart_beta,
             ).to(self.device)
             self.opt = torch.optim.Adam(self.agent.parameters(), params["lr"])
             self.memory = ReplayMemory(self.dtype)
@@ -390,7 +501,9 @@ def _build_worker_class(ray):
             return {k: v.detach().cpu() for k, v in self.agent.state_dict().items()}
 
         def get_avg_reward(self):
-            return float(np.mean(list(self.rewards)[-4:])) if self.rewards else 0.0
+            # Average over the recent window (deque maxlen=100).  Averaging only
+            # the last 4 steps is far too noisy to judge learning.
+            return float(np.mean(self.rewards)) if self.rewards else 0.0
 
         def get_last_loss(self):
             return self.last_loss
@@ -408,6 +521,11 @@ def _build_worker_class(ray):
             )
 
         def set_weights(self, weights):
+            # Recover from a previously diverged state: Adam's moments would
+            # still be NaN, so rebuild the optimiser before loading good weights.
+            if not all(bool(torch.isfinite(v).all()) for v in self.agent.state_dict().values()):
+                _LOG.warning("received non-finite weights; resetting the optimiser")
+                self.opt = torch.optim.Adam(self.agent.parameters(), self.lr)
             self.agent.load_state_dict(weights)
 
         def set_normalizer(self, normalizer):
@@ -432,6 +550,9 @@ def _build_worker_class(ray):
             ctx_np = build_contexts(obs_flat, index, self.ctx_size, data["dones"])
 
             ctx = torch.as_tensor(ctx_np, dtype=self.dtype, device=self.device)
+            if not bool(torch.isfinite(ctx).all()):
+                _LOG.warning("non-finite observations; skipping training")
+                return
             acts = torch.as_tensor(data["act"][index], dtype=self.dtype, device=self.device)
             behavior_logp = torch.as_tensor(
                 data["act_logprob"][index], dtype=self.dtype, device=self.device
@@ -441,10 +562,16 @@ def _build_worker_class(ray):
 
             last_loss = torch.tensor(0.0, device=self.device)
             for _ in range(self.epochs):
-                dist, values = self.agent.dist_value(ctx)
+                # Normalised point of view (PopArt): v_norm is the raw head output,
+                # values are the real-unit values fed to V-trace.
+                dist, v_norm = self.agent.dist_value_norm(ctx)
                 target_logp = dist.log_prob(acts).sum(-1)
-                _, bootstrap = self.agent.dist_value(self.context.get(self.device))
-                values_np = torch.cat([values.reshape(-1), bootstrap.reshape(-1)]).detach().cpu().numpy()
+                values = self.agent.dv.denormalize(v_norm).reshape(-1)
+                _, boot_norm = self.agent.dist_value_norm(self.context.get(self.device))
+                bootstrap = self.agent.dv.denormalize(boot_norm).reshape(-1)
+                values_np = (
+                    torch.cat([values, bootstrap]).detach().cpu().numpy()
+                )
 
                 # Targets are constants: no gradient flows through V-trace.
                 with torch.no_grad():
@@ -464,7 +591,11 @@ def _build_worker_class(ray):
                 if self.normalize_advantages and adv_t.numel() > 1:
                     # A per-batch affine transform of the advantages does not
                     # change the V-trace correction, it just scales the gradient.
-                    adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+                    # Only standardise when there is variance to divide by --
+                    # otherwise 0/0 produces NaNs.
+                    scale = adv_t.std()
+                    if float(scale) > 1e-6:
+                        adv_t = (adv_t - adv_t.mean()) / scale
 
                 if self.policy_loss == "ppo":
                     policy_loss = ppo_clipped_loss(
@@ -473,14 +604,35 @@ def _build_worker_class(ray):
                 else:
                     policy_loss = impala_policy_loss(target_logp, adv_t, rho_t)
 
-                value_loss = torch.mean((values.reshape(-1) - vs_t) ** 2)
+                # Value loss in PopArt's normalised space (scale-free).
+                normalised_target = self.agent.dv.normalize(vs_t).detach()
+                value_loss = torch.mean((v_norm.reshape(-1) - normalised_target) ** 2)
                 entropy = dist.entropy().sum(-1).mean()
-                last_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                if not torch.isfinite(loss):
+                    # A single pathological batch must not poison the weights.
+                    _LOG.warning("non-finite loss; skipping this update")
+                    self.opt.zero_grad(set_to_none=True)
+                    continue
 
                 self.opt.zero_grad(set_to_none=True)
-                last_loss.backward()
+                loss.backward()
+                grads_finite = all(
+                    parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
+                    for parameter in self.agent.parameters()
+                )
+                if not grads_finite:
+                    # Clipping inf/nan would turn it into nan; skip instead.
+                    _LOG.warning("non-finite gradients; skipping this update")
+                    self.opt.zero_grad(set_to_none=True)
+                    continue
                 torch.nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
                 self.opt.step()
+                # Adapt the value statistics; weights are rescaled so the
+                # predicted value itself does not jump.
+                if torch.isfinite(vs_t).all():
+                    self.agent.dv.update(vs_t)
+                last_loss = loss
 
             self.last_loss = float(last_loss.detach().cpu())
 
@@ -513,26 +665,39 @@ def _build_worker_class(ray):
 def _build_caller_class(ray):
     @ray.remote
     class WorkerCaller:
-        """Pump rollouts continuously until told to stop."""
+        """Pump rollouts continuously until told to stop.
+
+        The pump runs on a background *thread* inside the actor: a plain
+        ``while running:`` loop inside the actor method would occupy the actor's
+        only execution slot, so ``stop()`` could never be scheduled and the
+        program would hang on shutdown.
+        """
 
         def __init__(self, workers, rollout_steps):
             self.workers = workers
             self.n_workers = len(workers)
             self.rollout_steps = rollout_steps
-            self.running = True
+            self._stop = threading.Event()
+            self._thread = None
 
         def start(self):
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+        def _loop(self):
             pending = [w.rollout.remote(self.rollout_steps) for w in self.workers]
-            while self.running:
+            while not self._stop.is_set():
                 ready, _ = ray.wait(pending, num_returns=1, timeout=1.0)
                 for obj in ready:
                     index = pending.index(obj)
                     pending[index] = self.workers[index].rollout.remote(self.rollout_steps)
-                if not ready:
-                    time.sleep(0.01)
 
         def stop(self):
-            self.running = False
+            self._stop.set()
+            if self._thread is not None:
+                self._thread.join(timeout=5)
 
     return WorkerCaller
 
@@ -549,7 +714,7 @@ def run_parallel(args):
         ignore_reinit_error=True,
         include_dashboard=False,
     )
-    Worker = _build_worker_class(ray)
+    Worker = _build_worker_class(ray, num_gpus=args.worker_gpus)
     WorkerCaller = _build_caller_class(ray)
 
     params = {
@@ -567,6 +732,7 @@ def run_parallel(args):
         "clip": args.clip,
         "policy_loss": args.policy_loss,
         "normalize_advantages": args.normalize_advantages,
+        "popart_beta": args.popart_beta,
     }
     workers = [Worker.remote(params) for _ in range(args.n_workers)]
     avg_weight = ray.get(workers[0].get_weights.remote())
@@ -581,9 +747,20 @@ def run_parallel(args):
         for iteration in range(args.iterations):
             infos = ray.get([w.train_get_weights_infos.remote() for w in workers])
             workers_weights, workers_reward, workers_stats, workers_loss = zip(*infos)
-            avg_weight = {
-                k: sum(w[k] for w in workers_weights) / args.n_workers for k in avg_weight
-            }
+            # Ignore any worker that diverged, so one bad actor cannot poison
+            # the averaged weights everyone else receives.
+            healthy = [
+                weights
+                for weights in workers_weights
+                if all(bool(torch.isfinite(v).all()) for v in weights.values())
+            ]
+            if healthy:
+                avg_weight = {
+                    key: sum(weights[key] for weights in healthy) / len(healthy)
+                    for key in avg_weight
+                }
+            else:
+                _LOG.warning("all workers returned non-finite weights; keeping previous")
             for stats in workers_stats:
                 normalizer.aggregate(stats)
 
@@ -602,7 +779,7 @@ def run_parallel(args):
         print("manually stopped")
     finally:
         try:
-            ray.get(caller.stop.remote())
+            ray.get(caller.stop.remote(), timeout=15)
         except Exception:
             pass
         ray.shutdown()
@@ -635,7 +812,19 @@ def parse_args(argv=None):
         default=True,
         help="standardise V-trace advantages per batch before the policy loss",
     )
+    parser.add_argument(
+        "--popart-beta",
+        type=float,
+        default=0.99,
+        help="EMA decay for PopArt value statistics (first update is exact)",
+    )
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument(
+        "--worker-gpus",
+        type=float,
+        default=0.5,
+        help="GPU fraction requested per worker (n_workers * worker_gpus should be <= num_gpus)",
+    )
     parser.add_argument("--local-mode", action="store_true")
     return parser.parse_args(argv)
 

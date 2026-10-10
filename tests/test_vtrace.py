@@ -185,3 +185,43 @@ def test_ppo_clipped_loss_clips_the_ratio() -> None:
     far = torch.log(torch.tensor([10.0, 10.0]))
     loss = ppo.ppo_clipped_loss(far, behavior, advantages, clip=0.2)
     assert torch.isclose(loss, torch.tensor(-1.2))
+
+
+# --------------------------------------------------------------------------- #
+# PopArt value normalisation
+# --------------------------------------------------------------------------- #
+def test_popart_first_update_matches_batch_statistics() -> None:
+    popart = ppo.PopArtValue(4)
+    targets = torch.tensor([1.0, 2.0, 3.0])
+    popart.update(targets)
+    assert torch.allclose(popart.mean, targets.mean().reshape(1), atol=1e-6)
+    assert torch.allclose(popart.var, targets.var(unbiased=False).reshape(1), atol=1e-6)
+    normalised = popart.normalize(targets)
+    assert abs(float(normalised.mean())) < 1e-5
+    assert abs(float(normalised.std(unbiased=False)) - 1.0) < 1e-4
+
+
+def test_popart_update_preserves_predictions() -> None:
+    popart = ppo.PopArtValue(4, beta=0.5)
+    h = torch.randn(3, 4)
+    before = popart.denormalize(popart(h)).detach().clone()
+    popart.update(torch.tensor([-100.0, -200.0, -150.0]))
+    after = popart.denormalize(popart(h)).detach()
+    # Rescaling the head must not change the value it predicts.
+    assert torch.allclose(before, after, atol=1e-4)
+
+
+def test_popart_adapts_mean_over_repeated_updates() -> None:
+    popart = ppo.PopArtValue(4, beta=0.5)
+    for value in (10.0, 20.0, 30.0):
+        popart.update(torch.full((8,), value))
+    # EMA should have moved towards the recent targets.
+    assert 10.0 < float(popart.mean) < 30.0
+    assert float(popart.std) > 0.0
+
+
+def test_agent_value_head_uses_popart_buffers() -> None:
+    model = ppo.AgentModel(2, 4, 2, np.array([-1.0, -1.0]), np.array([1.0, 1.0]))
+    state = model.state_dict()
+    assert "dv.mean" in state and "dv.var" in state
+    assert model.dv.linear.weight.shape == (1, 128)

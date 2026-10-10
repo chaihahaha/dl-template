@@ -71,6 +71,32 @@ def test_normalizer_take_collect_resets_counters() -> None:
     assert np.all(std >= 0)
 
 
+def test_normalizer_aggregation_does_not_compound() -> None:
+    """Global stats must grow linearly, not like (1+n_workers)^iterations.
+
+    Regression test: when the running stats and the per-worker collection
+    counters were the same fields, the driver re-sent the global totals to the
+    workers, got them back and added them again -- overflowing to NaN within
+    ~50 syncs.
+    """
+    globaln = ppo.Normalizer((3,), np.float32)
+    workers = [ppo.Normalizer((3,), np.float32) for _ in range(2)]
+    for _ in range(50):
+        for worker in workers:
+            worker.adopt(globaln)
+            for _ in range(10):
+                worker.collect_obs(np.ones(3, dtype=np.float32))
+        for worker in workers:
+            globaln.aggregate(worker.take_collect())
+
+    assert abs(globaln.cnt_obs - 1000.0) < 1e-6  # 50 * 2 * 10
+    assert np.isfinite(globaln.sum_obs).all()
+    assert np.isfinite(globaln.sumsq_obs).all()
+    mean, std = globaln.mean_std_obs()
+    assert np.allclose(mean, 1.0)
+    assert np.all(std >= 0)
+
+
 def test_agent_shapes_and_registered_buffers() -> None:
     model = ppo.AgentModel(2, 4, 2, np.array([-1.0, -1.0]), np.array([1.0, 1.0]))
     state = model.state_dict()

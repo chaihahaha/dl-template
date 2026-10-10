@@ -81,6 +81,8 @@ __all__ = [
     "protect_scope",
     "protect_paths",
     "protect_torch",
+    "protect_numpy",
+    "protect_safetensors",
     "install",
     "uninstall",
     "is_installed",
@@ -523,6 +525,74 @@ def protect_torch() -> Any:
     return protected_save
 
 
+def _protect_save_function(
+    module: Any,
+    name: str,
+    *,
+    path_position: int,
+    path_keyword: str,
+) -> Any:
+    """Back up a path argument of ``module.name`` before it writes (idempotent)."""
+    original = getattr(module, name, None)
+    if original is None or getattr(original, "_dlt_protected", False):
+        return original
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        target = kwargs.get(path_keyword)
+        if target is None and len(args) > path_position:
+            target = args[path_position]
+        if isinstance(target, (str, bytes, os.PathLike)):
+            with _LOCK:
+                backup(os.fsdecode(os.fspath(target)))
+        return original(*args, **kwargs)
+
+    wrapper._dlt_protected = True  # type: ignore[attr-defined]
+    setattr(module, name, wrapper)
+    return wrapper
+
+
+def protect_numpy() -> list[Any]:
+    """Back up ``numpy.save`` / ``savez`` / ``savez_compressed`` destinations.
+
+    ``numpy`` does go through Python's ``open`` (so a scoped :func:`protect`
+    already covers it), but wrapping the save helpers lets you protect it
+    *without* any monkey-patching, and guards against numpy switching to a
+    lower-level writer in the future.
+    """
+    numpy = __import__("numpy")
+    protected = []
+    for name in ("save", "savez", "savez_compressed"):
+        result = _protect_save_function(
+            numpy, name, path_position=0, path_keyword="file"
+        )
+        if result is not None:
+            protected.append(result)
+    return protected
+
+
+def protect_safetensors() -> list[Any]:
+    """Back up ``safetensors.*.save_file`` destinations.
+
+    ``safetensors`` serialises through a Rust extension that does **not** call
+    Python's ``open``, so (like ``torch.save``) it must be wrapped explicitly.
+    """
+    import importlib
+
+    protected = []
+    for module_name in ("safetensors.torch", "safetensors.numpy", "safetensors.flax"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        result = _protect_save_function(
+            module, "save_file", path_position=1, path_keyword="filename"
+        )
+        if result is not None:
+            protected.append(result)
+    return protected
+
+
 def _auto_protect_optional() -> None:
     """Patch optional libraries that bypass ``open``, if they are loaded."""
     import sys
@@ -530,6 +600,16 @@ def _auto_protect_optional() -> None:
     if "torch" in sys.modules:
         try:
             protect_torch()
+        except Exception:  # pragma: no cover - best effort
+            pass
+    if "numpy" in sys.modules:
+        try:
+            protect_numpy()
+        except Exception:  # pragma: no cover - best effort
+            pass
+    if "safetensors" in sys.modules:
+        try:
+            protect_safetensors()
         except Exception:  # pragma: no cover - best effort
             pass
 

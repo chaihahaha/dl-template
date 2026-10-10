@@ -177,9 +177,30 @@ clip/GAE 假设 `mu≈pi`，因此是异策略的，训练会震荡。详见
 | 2 | 每个 minibatch 随机采样 | 打断 V-trace 沿时间的迹 | 对整段 rollout 做 `--epochs` 遍 |
 | 3 | `a_dist.log_prob(act)` 只取首个动作维 | 多维动作 log-prob 错误 | `log_prob(act).sum(-1)` 联合 log 概率 |
 | 4 | 跨 episode 直接堆叠上下文 | 上下文混入上一个 episode | `build_contexts(..., dones=...)` 在边界清零 |
-| 5 | 价值头无尺度先验（原代码硬编码 `/0.05`） | 价值比目标小两个数量级 | `value_scale = 1/(1-gamma)`，显式且随 gamma |
+| 5 | 价值头无尺度先验（原代码硬编码 `/0.05`） | 价值比目标小两个数量级，损失 O(1e4) | **PopArt**（滑动均值/方差 + 保输出缩放），损失回到 O(1) |
 | 6 | 优势未归一化 | 梯度尺度不稳 | `--normalize-advantages`（默认开，仿射标准化） |
 | 7 | 无 `rho_bar/c_bar/gamma/epochs` 参数 | 无法调异策略容忍度 | 全部走 argparse |
 
 新增 `tests/test_vtrace.py`：与论文公式的 O(T²) 直接实现逐步对齐、on-policy 退化、截断、
 done 边界、空输入/长度校验、损失梯度与裁剪。全套 93 个用例通过。
+
+---
+
+# 第六轮：PopArt + 真实 Ray GPU 实跑 + 更多写出 API
+
+在真实 Ray 多进程 + GTX 1070 上实跑时发现并修复：
+
+| # | 问题 | 修复 |
+| --- | --- | --- |
+| 1 | 价值损失 O(1e4)，价值头学不动 | **PopArt**（`PopArtValue`）：滑动均值/方差 + 保输出缩放，损失回到 O(1) |
+| 2 | `WorkerCaller.start()` 的 `while` 占满 actor 执行槽 | actor 内用后台线程 pump，`stop()` 才能被调度；否则退出时挂死 |
+| 3 | 每个 worker 固定 0.5 GPU | `--worker-gpus` 参数化，支持多 worker 共享一张卡 |
+| 4 | 优势标准化在方差≈0 时 0/0 → NaN | 仅当 `std > 1e-6` 才标准化 |
+| 5 | 动作 std 饱和到 0 → 高斯熵 `-inf` | `acov = sigmoid(...) + 1e-3` 下限 |
+| 6 | PopArt 方差≈0 时归一化目标爆炸 | `std` 下限（`sqrt(var+1e-4).clamp(min=1e-3)`） |
+| 7 | 单个坏 batch 的 NaN 污染权重 | 非有限 loss 跳过该步（`continue`） |
+| 8 | `numpy.save` / `safetensors` 等写出 API | `protect_numpy()` / `protect_safetensors()`；实测 safetensors **0 次** Python `open` |
+| 9 | `Normalizer` 把全局统计与 worker 增量混用 → 每轮同步重复累加，`(1+n)^iters` 爆炸成 NaN | 拆成全局 `sum_obs/...` 与增量 `sum_obs_collect/...`，`adopt()` 复制全局并清空增量 |
+
+实测（真实 Ray，4 worker × 0.25 GPU，`lr=1e-3`）：1000 步内 loss 稳定在 O(0.1~0.9)，
+无 NaN；PopArt 统计量收敛到回报量级（mean≈-400, std≈120）。

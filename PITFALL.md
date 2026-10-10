@@ -156,5 +156,53 @@ context 里混着上一个 episode 的观测，价值/策略输入就错了。`b
 
 折扣回报量级 ≈ `reward/(1-gamma)`（`gamma=0.99` 时约为每步奖励的 100 倍）。旧代码用
 `value = dv(h)/(1-gamma)` 硬编码了这个尺度（当时 gamma=0.95）。重构时如果直接把除以
-`(1-gamma)` 删掉，价值头会比目标小 ~200 倍，MSE 巨大、学习极慢。要么保留尺度先验，要么
-上 PopArt。
+`(1-gamma)` 删掉，价值头会比目标小 ~200 倍，MSE 巨大、学习极慢。最终采用 **PopArt**
+（滑动均值/方差 + 更新时缩放输出层保持输出不变），损失在归一化空间计算——实测归一化损失
+从 O(1e4) 降到 O(0.1)，统计量自动收敛到回报量级（mean≈-259, std≈113）。
+
+---
+
+# 第六轮补充
+
+## 25. Ray actor 里的 `while` 循环会让 `stop()` 永远排不上
+
+`WorkerCaller.start()` 原来在 actor 方法里 `while running: ...`，而 `running` 只能由
+`stop()` 修改；actor 单线程，`start()` 不返回就一直占着执行槽，`stop()` 永远调度不到，
+`ray.get(caller.stop.remote())` 永久阻塞 → 退出挂死（表现为 GPU 一直 90%+）。
+**修复**：`start()` 里起一个后台线程跑 pump，方法立即返回，actor 才能处理 `stop()`。
+
+## 26. PopArt 的 eps 要一致，否则缩放系数会爆
+
+`normalize()` 用带 eps/下限的 `std`，但 `update()` 里如果用自己的 `sqrt(var+1e-8)` 算
+`scale = old_std/new_std`，当 `new_var≈0` 时 `scale` 可达 1e4 量级，输出层权重瞬间炸成
+NaN。两处必须用同一个 `sqrt(var+1e-4).clamp(min=1e-3)`。
+
+## 27. 多 worker 权重平均会把一个 NaN 传染给所有人
+
+`avg = sum(weights)/n`：只要有一个 worker 出现 NaN，平均值就是 NaN。驱动端应先过滤掉
+非有限的权重再平均；worker 端在 `set_weights` 前若发现自身参数非有限，要**重建优化器**
+（Adam 的 exp_avg/exp_avg_sq 也是 NaN，只换权重没用）。
+
+## 28. `clip_grad_norm_` 不能救 inf/nan 梯度
+
+`clip_grad_norm_` 遇到含 inf/nan 的梯度会算出 NaN 系数，反而把梯度变成 NaN。
+在裁剪前先判断 `torch.isfinite(grad).all()`，不满足就跳过这一步。
+
+## 29. 数值护栏清单（真实多进程实跑踩出来的）
+
+* 动作标准差 `sigmoid(...)` 会饱和到 0 → 高斯熵 `-inf`，要加下限 `+1e-3`；
+* 优势标准化在 batch 方差≈0 时是 0/0，要判 `std > 1e-6` 再除；
+* loss 非有限时跳过该步；观测/权重/梯度非有限时都要有兜底；
+* 多 worker 共享一张卡用 `--worker-gpus`（如 4×0.25），否则默认 0.5 会因 GPU 资源不足排不上。
+
+## 30. 全局统计和“本 worker 增量”必须分开存（否则指数爆炸）
+
+`Normalizer` 一开始用同一组 `sum_obs/sumsq_obs/cnt_obs` 既做归一化用的全局统计，又做
+`take_collect` 的增量累加器。于是每轮同步：driver 把全局统计发给 worker → worker 在其上
+继续 collect → `take_collect` 把“全局+增量”交回 → driver 再加一遍。统计量按
+`(1+n_workers)^iterations` 增长，~50 轮后溢出成 inf/NaN，表现为训练中途
+`Normal(expected ... loc nan)`。
+
+**修复**：`sum_obs/sumsq_obs/cnt_obs` 只存全局统计；`sum_obs_collect/...` 只存本 worker 增量，
+`take_collect` 只取后者并清零，`set_normalizer` 用 `adopt()` 复制全局统计并清空增量。
+回归测试 `test_normalizer_aggregation_does_not_compound` 断言 50 轮后 cnt == 1000（线性）。

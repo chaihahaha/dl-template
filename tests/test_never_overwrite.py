@@ -288,3 +288,53 @@ def test_protect_paths_reports_unknown_argument() -> None:
 
     with pytest.raises(TypeError):
         save(1)
+
+
+# --------------------------------------------------------------------------- #
+# writers that bypass (or are easier to wrap than) builtins.open
+# --------------------------------------------------------------------------- #
+def test_scoped_protect_covers_numpy_save(tmp_path: Path) -> None:
+    numpy = pytest.importorskip("numpy")
+    target = tmp_path / "array.npy"
+    numpy.save(target, numpy.zeros(3))
+
+    with nw.protect_scope():
+        numpy.save(target, numpy.ones(3))
+
+    assert len(backups_of(tmp_path, "array")) == 1
+    assert target.stat().st_size > 0
+
+
+def test_protect_numpy_wraps_save_without_patching_open(tmp_path: Path) -> None:
+    numpy = pytest.importorskip("numpy")
+    original = numpy.save
+    try:
+        nw.protect_numpy()
+        assert getattr(numpy.save, "_dlt_protected", False) is True
+
+        target = tmp_path / "ckpt.npy"
+        numpy.save(target, numpy.arange(5))
+        numpy.save(target, numpy.arange(5) * 2)
+
+        kept = backups_of(tmp_path, "ckpt")
+        assert len(kept) == 1
+        assert builtins.open is not nw.safe_open  # no monkey patch needed
+    finally:
+        numpy.save = original
+
+
+def test_protect_safetensors_wraps_save_file(tmp_path: Path) -> None:
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    torch = pytest.importorskip("torch")
+    original = safetensors_torch.save_file
+    try:
+        nw.protect_safetensors()
+        assert getattr(safetensors_torch.save_file, "_dlt_protected", False) is True
+
+        target = tmp_path / "model.safetensors"
+        safetensors_torch.save_file({"w": torch.zeros(2)}, target)
+        safetensors_torch.save_file({"w": torch.ones(2)}, target)
+
+        assert len(backups_of(tmp_path, "model")) == 1
+    finally:
+        safetensors_torch.save_file = original

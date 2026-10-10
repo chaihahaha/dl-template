@@ -11,7 +11,7 @@
 - [x] 旧根文件改为兼容 shim（`never_overwrite` / `plot_utils` / `yaml_logging`）
 - [x] `rl_ray_ppo.py` → `examples/rl_ray_ppo.py`（现代 gymnasium + 修 bug）
 - [x] `examples/train_demo.py` 端到端示例（已验证可运行）
-- [x] `tests/` 93 个用例全绿（含 async 日志、PPO 内存、V-trace、plot 极端情况、Lightning）
+- [x] `tests/` 101 个用例全绿（含 async 日志、PPO 内存、V-trace、PopArt、plot 极端情况、Lightning）
 - [x] `pyproject.toml`、`README.md`、`docs/FIXES.md`、`docs/DESIGN.md`
 - [x] `.gitignore` 补齐 AGENTS.md 要求的目录
 
@@ -63,11 +63,28 @@
 
 ## 待办 / 可继续改进
 
-- [ ] `examples/rl_ray_ppo.py` 只用 no-op Ray stub 驱动过真实 `Worker`（缓冲/RSS 有界，
-      见 `tests/test_ppo_worker.py`），尚未用真实 Ray 多进程实跑。
+- [x] `examples/rl_ray_ppo.py` 用**真实 Ray 多进程 + GPU** 实跑（见下方第六轮）
 - [ ] 可选：为 `YamlLogger` 增加 `tensorboard` 导出适配器（不引入硬依赖）。
-- [ ] 可选：`never_overwrite` 支持 `numpy.save`、`safetensors` 等绕过 `open` 的写出 API。
+- [x] `never_overwrite` 支持 `numpy.save` / `safetensors` 等写出 API（`protect_numpy()` /
+      `protect_safetensors()`；safetensors 实测绕过 Python `open`）
 - [ ] 可选：CI（GitHub Actions）跑 `pytest`。
+
+## 第六轮（PopArt + 真实 Ray GPU 实跑 + 更多写出 API）
+
+- [x] **PopArt** 价值归一化（`PopArtValue`）：滑动均值/方差 + 更新时缩放输出层保持输出不变；
+      归一化损失从 O(1e4) 降到 O(0.1~0.9)，统计量自动收敛到回报量级
+- [x] 修真实多进程实跑时发现的 **WorkerCaller 退出死锁**：`start()` 的 `while` 占满 actor
+      执行槽导致 `stop()` 永远排不上 → 改为 actor 内后台线程 pump，`stop()` 可被调度
+- [x] `--worker-gpus` 参数化每个 worker 的 GPU 份额（支持多 worker 共享一张卡）
+- [x] 数值稳定护栏：动作 std 下限、优势标准化方差过小时跳过、PopArt std 下限、
+      非有限 loss/梯度/权重兜底、驱动端过滤非有限权重
+- [x] **修 `Normalizer` 全局统计与 worker 增量混用导致的指数爆炸**（真实多进程跑到
+      ~50 轮后 NaN 的根因）：拆分全局 `sum_obs/...` 与增量 `sum_obs_collect/...`，
+      `adopt()` 复制全局并清空增量；新增线性增长回归测试
+- [x] `never_overwrite.protect_numpy()` / `protect_safetensors()` + `_auto_protect_optional`
+- [x] 新增 PopArt / numpy / safetensors 测试；全套 100 用例
+- [x] 环境：`ray 2.59`、`safetensors 0.8` 装入 `envs/venv`（PyPI 直连被限速，
+      改用腾讯云镜像下载 wheel）
 
 ## 环境备注
 

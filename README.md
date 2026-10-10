@@ -44,8 +44,8 @@ python examples/rl_ray_ppo.py --iterations 500   # 需 ray + gymnasium；IMPALA 
 ```
 
 > `rl_ray_ppo.py` 是分布式 actor-learner：actor 与 learner 异步导致数据来自旧策略（异策略），
-> 因此默认用 **IMPALA 的 V-trace** 做截断重要性采样修正，而不是裸 PPO。
-> 原理、公式与调参见 [`docs/IMPALA_VTRACE.md`](docs/IMPALA_VTRACE.md)。
+> 因此默认用 **IMPALA 的 V-trace** 做截断重要性采样修正（价值头用 **PopArt** 归一化），
+> 而不是裸 PPO。原理、公式与调参见 [`docs/IMPALA_VTRACE.md`](docs/IMPALA_VTRACE.md)。
 
 会生成一个实验目录：
 
@@ -199,7 +199,14 @@ with protect_scope(only=["runs/exp1"], policy=BackupPolicy(keep=5)):
 
 # 3) 一次性备份
 backup("result.csv")          # 立刻把已存在的 result.csv 改名留档
+
+# 4) 有些库绕过了 Python open，用它们的专用包装（或不包装时用上面的 protect_paths）
+from dlt.never_overwrite import protect_torch, protect_numpy, protect_safetensors
+protect_torch(); protect_numpy(); protect_safetensors()
 ```
+
+> `torch.save`、`safetensors save_file` 走 C++/Rust 写出路径，**不经过 Python `open`**；
+> 对它们要用 `protect_*()` 或 `@protect_paths`。`numpy.save` 走 `open`，两种方式都行。
 
 只有在确实需要“整个进程都保护”时才显式全局安装：
 
