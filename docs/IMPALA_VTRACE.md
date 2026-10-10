@@ -130,6 +130,44 @@ eps 不一致等（见 `PITFALL.md` 第 25–30 条）。复现绘图的脚本�
 > 说明：这里验证的是**修正的正确性与训练稳定性**（以及指标确实上升），不是“多少步解出
 > Pendulum”。Pendulum 完全收敛需要远多于示例默认步数；示例的定位是可读、可扩展的分布式骨架。
 
+## 6. 收敛慢 / 看着不稳定，原因与调法
+
+第一版 1200 迭代的曲线（`reports/rl_impala_reward.png`）在 per-step reward ≈ -4.3 处“平台化”，
+看起来既不收敛也不稳定。逐项排查后的结论：
+
+1. **训练量不够**：`rollout_steps=128, epochs=2, 4 workers, 1200 iters` ≈ **0.6M 环境步**、
+   每个 worker 只有 **~2400 次优化**。Pendulum 用 IMPALA 通常要百万级步 / 上万次更新。
+2. **指标太噪**：`avg_reward` 是最近 100 个 **per-step** reward 的均值；Pendulum 的初始角度
+   方差极大，5 个随机 episode 的评估噪声就有 ±200。于是“抖动”很多是**评估噪声**，不是策略崩。
+   → 新增 `Worker.evaluate()`：用**固定种子**跑 K 个 episode、取确定性动作（`dist.mean`）的
+   **episode return**，才能干净地看收敛。
+3. **常数学习率 + 每步同步**：把训练量加到 3000 迭代（rollout 256、epochs 4、~6M 步、
+   ~48k 更新）后，策略能到近最优（eval **-177**），但会在 **-177 ↔ -1055** 之间来回振荡。
+   原因：没有信任域/KL 约束（V-trace 只修正偏差、不降方差）；worker 每步（或每 4 步）平均权重、
+   但 Adam 的动量没有一起平均，每次同步都会踢一下优化轨迹；多 epoch 复用旧数据。
+4. **修复：学习率退火**。新增 `--lr-final`，driver 每次迭代把线性衰减后的 lr 下发给 worker。
+   同样 2000 迭代、`3e-4 → 3e-5`，固定种子评估的曲线平滑收敛到 **-208 ~ -290**（近最优，
+   见 `reports/rl_impala_annealed.png`），对比同迭代数下常数 lr 的 **-888 ~ -1033**。
+
+可调项：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--lr-final` | 线性退火（**最有效的稳定手段**） |
+| `--sync-every N` | 每 N 次迭代才平均一次权重（默认 1；调大更接近真正异步 IMPALA，减少同步踢动） |
+| `--policy-loss ppo` | 用 V-trace 优势 + PPO clip 作为信任域 |
+| `--epochs` | 每批数据复用次数；越大越 off-policy，靠 V-trace 纠正，建议 ≤ 4 |
+| `--eval-every/--eval-episodes` | 固定种子 episode-return 评估 |
+
+推荐配置：
+
+```bash
+python examples/rl_ray_ppo.py \
+  --iterations 2000 --n-workers 4 --worker-gpus 0.25 \
+  --rollout-steps 256 --epochs 4 --lr 3e-4 --lr-final 3e-5 \
+  --sync-every 4 --eval-every 50 --eval-episodes 15
+```
+
 ## 参考
 
 * IMPALA 论文：Espeholt et al., *IMPALA: Scalable Distributed Deep-RL with Importance

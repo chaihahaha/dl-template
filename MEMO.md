@@ -86,6 +86,20 @@
 - [x] 环境：`ray 2.59`、`safetensors 0.8` 装入 `envs/venv`（PyPI 直连被限速，
       改用腾讯云镜像下载 wheel）
 
+## 第七轮（收敛诊断：为什么曲线不好看/不稳）
+
+用户看 `reports/rl_impala_reward.png` 觉得没收敛、不稳定。排查结论：
+
+- [x] 定位三点：① 第一版训练量不够（0.6M 步 / 2400 次更新）；② `avg_reward`（100 步
+      per-step 均值）在 Pendulum 上噪声极大；③ 补足训练量后仍有真实后期振荡（-177↔-1055），
+      根因是常数 lr + 权重平均但 Adam 动量不同步 + 无信任域。
+- [x] 新增 `Worker.evaluate()`（固定种子、确定性动作、episode return）——评估曲线立刻平滑
+- [x] 新增 `--lr-final` 线性退火（driver 每步 `set_lr`），2000 迭代 3e-4→3e-5 平滑收敛到
+      **-208 ~ -290**（对比同迭代数常数 lr 的 -888~-1033）
+- [x] 新增 `--sync-every`（权重平均频率）；`--eval-every/--eval-episodes`
+- [x] `scripts/plot_rl_log.py` 支持画 eval_return
+- [x] 报告 `reports/rl_impala_run.md` + 三张对比图
+
 ## 环境备注
 
 - 本机 Python 3.13，`yaml`/`numpy`/`torch`/`tqdm` 已有；`Pillow`/`dill`/`matplotlib`/`pytest`

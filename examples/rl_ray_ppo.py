@@ -531,12 +531,49 @@ def _build_worker_class(ray, num_gpus=0.5):
         def set_normalizer(self, normalizer):
             self.context.set_normalizer(normalizer)
 
+        def set_lr(self, lr):
+            """Update the learning rate (used for annealing by the driver)."""
+            self.lr = float(lr)
+            for group in self.opt.param_groups:
+                group["lr"] = self.lr
+
         def reset_initialize(self):
             self.context.reset()
             obs, _ = self.env.reset()
             self.context.normalizer.collect_obs(obs)
             self.context.add(obs)
             self.T = 0
+
+        @torch.no_grad()
+        def evaluate(self, episodes=5):
+            """Mean episode return of the deterministic (mean-action) policy.
+
+            Episodes use fixed seeds so successive evaluations measure the
+            policy instead of the (large) variation of Pendulum's random
+            starting angle; otherwise a 5-episode estimate is very noisy.
+            """
+            returns = []
+            for episode in range(episodes):
+                obs, _ = self.env.reset(seed=1000 + episode)
+                context = [np.zeros(self.d_obs, dtype=np.float32) for _ in range(self.ctx_size)]
+                context.append(self.context.normalizer.normalize_obs(obs))
+                context.pop(0)
+                episode_return = 0.0
+                done = False
+                while not done:
+                    batch = torch.as_tensor(
+                        np.stack(context, 0), dtype=self.dtype, device=self.device
+                    ).unsqueeze(0)
+                    distribution, _ = self.agent.dist_value(batch)
+                    action = distribution.mean.detach().cpu().numpy()[0]
+                    obs, reward, terminated, truncated, _ = self.env.step(action)
+                    context.append(self.context.normalizer.normalize_obs(obs))
+                    context.pop(0)
+                    episode_return += float(reward)
+                    done = bool(terminated or truncated)
+                returns.append(episode_return)
+            self.done = True  # the next rollout must restart the training episode
+            return float(np.mean(returns))
 
         # -- learning (the IMPALA/V-trace part) ---------------------------- #
         def train_policy(self):
@@ -747,33 +784,56 @@ def run_parallel(args):
         for iteration in range(args.iterations):
             infos = ray.get([w.train_get_weights_infos.remote() for w in workers])
             workers_weights, workers_reward, workers_stats, workers_loss = zip(*infos)
-            # Ignore any worker that diverged, so one bad actor cannot poison
-            # the averaged weights everyone else receives.
-            healthy = [
-                weights
-                for weights in workers_weights
-                if all(bool(torch.isfinite(v).all()) for v in weights.values())
-            ]
-            if healthy:
-                avg_weight = {
-                    key: sum(weights[key] for weights in healthy) / len(healthy)
-                    for key in avg_weight
-                }
-            else:
-                _LOG.warning("all workers returned non-finite weights; keeping previous")
             for stats in workers_stats:
                 normalizer.aggregate(stats)
 
+            # Averaging every single iteration is "local SGD with a sync every
+            # step": workers barely train before their weights are replaced.
+            # Syncing every --sync-every iterations lets each worker make real
+            # progress and is closer to true async IMPALA (stale actors), which
+            # is exactly what V-trace corrects for.
+            sync_now = args.sync_every <= 1 or iteration % args.sync_every == 0
+            if sync_now:
+                # Ignore any worker that diverged, so one bad actor cannot
+                # poison the averaged weights everyone else receives.
+                healthy = [
+                    weights
+                    for weights in workers_weights
+                    if all(bool(torch.isfinite(v).all()) for v in weights.values())
+                ]
+                if healthy:
+                    avg_weight = {
+                        key: sum(weights[key] for weights in healthy) / len(healthy)
+                        for key in avg_weight
+                    }
+                else:
+                    _LOG.warning("all workers returned non-finite weights; keeping previous")
+
             handles = []
+            if args.lr_final is not None:
+                # Linear annealing: the standard cure for late-phase oscillation.
+                lr_now = args.lr + (args.lr_final - args.lr) * (
+                    iteration / max(1, args.iterations - 1)
+                )
+            else:
+                lr_now = args.lr
             for worker in workers:
-                handles.append(worker.set_weights.remote(avg_weight))
+                if sync_now:
+                    handles.append(worker.set_weights.remote(avg_weight))
                 handles.append(worker.set_normalizer.remote(normalizer))
+                handles.append(worker.set_lr.remote(lr_now))
             ray.get(handles)
 
-            print(
+            line = (
                 f"[{iteration}] avg_reward={sum(workers_reward) / args.n_workers:.3f} "
                 f"loss={sum(workers_loss) / args.n_workers:.3f}"
             )
+            if args.eval_every and (iteration + 1) % args.eval_every == 0:
+                eval_returns = ray.get(
+                    [w.evaluate.remote(args.eval_episodes) for w in workers]
+                )
+                line += f" eval_return={float(np.mean(eval_returns)):+.1f}"
+            print(line)
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("manually stopped")
@@ -794,6 +854,12 @@ def parse_args(argv=None):
     parser.add_argument("--rollout-steps", type=int, default=128)
     parser.add_argument("--ctx-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument(
+        "--lr-final",
+        type=float,
+        default=None,
+        help="if set, linearly anneal the learning rate from --lr to this value",
+    )
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--rho-bar", type=float, default=1.0, help="V-trace rho truncation")
     parser.add_argument("--c-bar", type=float, default=1.0, help="V-trace c truncation")
@@ -818,6 +884,19 @@ def parse_args(argv=None):
         default=0.99,
         help="EMA decay for PopArt value statistics (first update is exact)",
     )
+    parser.add_argument(
+        "--sync-every",
+        type=int,
+        default=1,
+        help="average worker weights every N iterations (1 = every iteration)",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=0,
+        help="evaluate deterministic episode return every N iterations (0 = off)",
+    )
+    parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument(
         "--worker-gpus",
