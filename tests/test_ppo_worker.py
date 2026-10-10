@@ -61,3 +61,15 @@ def test_worker_buffers_stay_bounded() -> None:
     assert max_buffer <= 128, "replay buffer grew past the rollout cadence"
     assert max_rewards <= 100, "reward history is not a bounded deque"
     assert len(worker.memory) <= 128
+
+
+def test_worker_evaluate_is_deterministic_and_finite() -> None:
+    worker_class = _load_worker_class()
+    worker = worker_class(
+        {"ctx_size": 8, "rollout_steps": 128, "lr": 5e-4, "dtype": torch.float32}
+    )
+    worker.reset_initialize()
+    first = worker.evaluate(2)
+    second = worker.evaluate(2)
+    assert first == second  # fixed seeds + deterministic mean action
+    assert first < 0.0  # Pendulum returns are negative

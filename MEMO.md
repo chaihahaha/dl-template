@@ -100,6 +100,18 @@
 - [x] `scripts/plot_rl_log.py` 支持画 eval_return
 - [x] 报告 `reports/rl_impala_run.md` + 三张对比图
 
+## 第八轮（保存收敛策略 + 渲染 MP4）
+
+- [x] `examples/rl_ray_ppo.py` 新增 `--checkpoint-dir`：每次评估刷新最好成绩就原子保存
+      `best.pt`（权重 + 观测归一化统计），并用 `never_overwrite.protect_paths` 保护旧文件
+- [x] `Normalizer.state()/load_state()`；Worker `get_normalizer_state()`（纯 dict，避免
+      pickle 引用训练脚本 `__main__` 的类）
+- [x] `scripts/render_policy.py`：加载 checkpoint，用 gymnasium `rgb_array` + pygame 无头渲染，
+      imageio-ffmpeg 写 H.264，叠加 iteration/eval/return；支持 `--random` 对比
+- [x] 实测收敛策略（iter 849, eval -200）动画：seed 0/1/2/3 回报 -136.8 / -7.9 / -123.3 /
+      -361.9（随机 ~-1500）；产物 `reports/pendulum_best.mp4`、`reports/pendulum_random.mp4`
+- [x] 环境新增 `pygame 2.6`、`imageio`、`imageio-ffmpeg`（腾讯云镜像）
+
 ## 环境备注
 
 - 本机 Python 3.13，`yaml`/`numpy`/`torch`/`tqdm` 已有；`Pillow`/`dill`/`matplotlib`/`pytest`

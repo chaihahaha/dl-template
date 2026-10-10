@@ -97,6 +97,19 @@ def test_normalizer_aggregation_does_not_compound() -> None:
     assert np.all(std >= 0)
 
 
+def test_normalizer_state_roundtrip() -> None:
+    normalizer = ppo.Normalizer((4,), np.float32)
+    for _ in range(3):
+        normalizer.collect_obs(np.full(4, 2.0, dtype=np.float32))
+    state = normalizer.state()
+    restored = ppo.Normalizer((4,), np.float32)
+    restored.load_state(state)
+    assert restored.cnt_obs == normalizer.cnt_obs
+    assert np.allclose(restored.sum_obs, normalizer.sum_obs)
+    assert np.allclose(restored.sumsq_obs, normalizer.sumsq_obs)
+    assert restored.cnt_obs_collect == 0.0  # deltas start fresh
+
+
 def test_agent_shapes_and_registered_buffers() -> None:
     model = ppo.AgentModel(2, 4, 2, np.array([-1.0, -1.0]), np.array([1.0, 1.0]))
     state = model.state_dict()

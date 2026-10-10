@@ -58,12 +58,34 @@ import collections
 import logging
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 _LOG = logging.getLogger("dlt.rl_ray_ppo")
+
+try:  # optional: back up a previous checkpoint instead of clobbering it
+    from dlt.never_overwrite import protect_paths as _protect_paths
+except Exception:  # pragma: no cover - allow the example to be copied standalone
+    def _protect_paths(*args, **kwargs):  # type: ignore[misc]
+        def decorate(function):
+            return function
+        return decorate
+
+
+@_protect_paths("path")
+def save_checkpoint(payload, path):
+    """Atomically save a checkpoint, backing up any previous file at ``path``."""
+    import os
+
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+    return path
 
 __all__ = [
     "vtrace_targets",
@@ -396,6 +418,21 @@ class Normalizer:
         self.cnt_obs = float(other.cnt_obs)
         self.reset_collect()
 
+    def load_state(self, state):
+        """Restore running statistics from a plain ``{"sum","sumsq","cnt"}`` dict."""
+        self.sum_obs = np.array(state["sum"], dtype=self.dtype)
+        self.sumsq_obs = np.array(state["sumsq"], dtype=self.dtype)
+        self.cnt_obs = float(state["cnt"])
+        self.reset_collect()
+
+    def state(self):
+        """Plain-dict snapshot (safe to store in a checkpoint, no class refs)."""
+        return {
+            "sum": np.array(self.sum_obs, dtype=self.dtype, copy=True),
+            "sumsq": np.array(self.sumsq_obs, dtype=self.dtype, copy=True),
+            "cnt": float(self.cnt_obs),
+        }
+
     def mean_std_obs(self):
         if self.cnt_obs <= 0:
             return np.zeros(self.obs_shape, dtype=self.dtype), np.ones(
@@ -499,6 +536,16 @@ def _build_worker_class(ray, num_gpus=0.5):
 
         def get_weights(self):
             return {k: v.detach().cpu() for k, v in self.agent.state_dict().items()}
+
+        def get_normalizer(self):
+            """Snapshot of the observation normaliser (needed to replay the policy)."""
+            import copy
+
+            return copy.deepcopy(self.context.normalizer)
+
+        def get_normalizer_state(self):
+            """Plain-dict normaliser stats (checkpoint-friendly, no class refs)."""
+            return self.context.normalizer.state()
 
         def get_avg_reward(self):
             # Average over the recent window (deque maxlen=100).  Averaging only
@@ -779,6 +826,7 @@ def run_parallel(args):
     normalizer = Normalizer((d_obs,), np.float32)
     caller = WorkerCaller.remote(workers, args.rollout_steps)
     caller.start.remote()
+    best_eval = float("-inf")
 
     try:
         for iteration in range(args.iterations):
@@ -832,7 +880,21 @@ def run_parallel(args):
                 eval_returns = ray.get(
                     [w.evaluate.remote(args.eval_episodes) for w in workers]
                 )
-                line += f" eval_return={float(np.mean(eval_returns)):+.1f}"
+                mean_eval = float(np.mean(eval_returns))
+                line += f" eval_return={mean_eval:+.1f}"
+                if args.checkpoint_dir and mean_eval > best_eval:
+                    best_eval = mean_eval
+                    payload = {
+                        "state_dict": ray.get(workers[0].get_weights.remote()),
+                        "normalizer_state": ray.get(
+                            workers[0].get_normalizer_state.remote()
+                        ),
+                        "params": params,
+                        "iteration": iteration,
+                        "eval_return": mean_eval,
+                    }
+                    saved = save_checkpoint(payload, Path(args.checkpoint_dir) / "best.pt")
+                    line += f" saved={saved}"
             print(line)
             time.sleep(0.1)
     except KeyboardInterrupt:
@@ -897,6 +959,11 @@ def parse_args(argv=None):
         help="evaluate deterministic episode return every N iterations (0 = off)",
     )
     parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="save best-by-eval weights + normaliser here (for scripts/render_policy.py)",
+    )
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument(
         "--worker-gpus",

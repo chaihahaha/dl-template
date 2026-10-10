@@ -47,6 +47,16 @@ python examples/rl_ray_ppo.py --iterations 500   # 需 ray + gymnasium；IMPALA 
 > 因此默认用 **IMPALA 的 V-trace** 做截断重要性采样修正（价值头用 **PopArt** 归一化），
 > 而不是裸 PPO。原理、公式与调参见 [`docs/IMPALA_VTRACE.md`](docs/IMPALA_VTRACE.md)。
 
+训练时用 `--checkpoint-dir` 保存“评估最好”的权重，再把收敛策略渲染成动画：
+
+```bash
+python examples/rl_ray_ppo.py --iterations 2000 --n-workers 4 --worker-gpus 0.25 \
+    --rollout-steps 256 --epochs 4 --lr 3e-4 --lr-final 3e-5 --sync-every 4 \
+    --eval-every 50 --eval-episodes 15 --checkpoint-dir runs/impala-pendulum
+python scripts/render_policy.py runs/impala-pendulum/best.pt --episodes 4 \
+    -o reports/pendulum_best.mp4        # 需要 gymnasium/pygame/imageio-ffmpeg
+```
+
 会生成一个实验目录：
 
 ```

@@ -168,6 +168,21 @@ python examples/rl_ray_ppo.py \
   --sync-every 4 --eval-every 50 --eval-episodes 15
 ```
 
+## 7. 保存权重并把策略渲染成动画
+
+训练时加 `--checkpoint-dir runs/impala-pendulum`：每次评估若刷新最好成绩，就把
+**权重 + 观测归一化统计** 存到 `best.pt`（原子写，并用 `never_overwrite` 保护旧文件）。
+注意存的是“评估最好”而不是“最后一次”——本示例后期仍会波动，best 往往远好于 last。
+
+```bash
+python scripts/render_policy.py runs/impala-pendulum/best.pt --episodes 4 \
+    -o reports/pendulum_best.mp4
+```
+
+`render_policy.py` 用 `render_mode="rgb_array"` + pygame 无头渲染，imageio-ffmpeg 编码
+H.264；画面上叠加 iteration / eval_return / episode return。`--random` 可渲染未训练策略做对比。
+实测收敛策略在 seed 0/1/2/3 上的回报为 **-136.8 / -7.9 / -123.3 / -361.9**（随机策略约 -1500）。
+
 ## 参考
 
 * IMPALA 论文：Espeholt et al., *IMPALA: Scalable Distributed Deep-RL with Importance
